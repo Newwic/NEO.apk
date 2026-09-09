@@ -16,16 +16,12 @@ android {
 
         val ciBuild = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull()
         versionCode = ciBuild ?: 1
-        versionName = if (ciBuild != null) "0.2.$ciBuild" else "0.2.0"
+        versionName = if (ciBuild != null) "0.3.$ciBuild" else "0.3.0"
     }
 
     buildTypes {
-        debug {
-            isMinifyEnabled = false
-        }
-        release {
-            isMinifyEnabled = false
-        }
+        debug { isMinifyEnabled = false }
+        release { isMinifyEnabled = false }
     }
 
     buildFeatures { compose = true }
@@ -49,5 +45,6 @@ dependencies {
     implementation("androidx.room:room-runtime:2.6.1")
     implementation("androidx.room:room-ktx:2.6.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("dev.ffmpegkit-maintained:llama-android:0.1.1")
     ksp("androidx.room:room-compiler:2.6.1")
 }
