@@ -51,13 +51,8 @@ class LocalBrain(private val context: Context) {
             if (!downloadModel(file, onStatus)) return@withLock false
         }
         return@withLock try {
-            val gb = file.length().toDouble() / 1_073_741_824.0
-            onStatus("LOCAL • พบโมเดล 7B %.1f GB • กำลังโหลด…".format(gb))
-            model = Llama.loadModel(modelPath = file.absolutePath, config = LlamaConfig(
-                contextSize = 1024,
-                threads = Runtime.getRuntime().availableProcessors().coerceIn(4, 5),
-                gpuLayers = 0, temperature = 0.55f, topP = 0.9f, topK = 40
-            ))
+            onStatus("LOCAL • กำลังโหลด Qwen2.5 7B…")
+            model = Llama.loadModel(file.absolutePath, LlamaConfig(contextSize=1024, threads=Runtime.getRuntime().availableProcessors().coerceIn(4,5), gpuLayers=0, temperature=0.45f, topP=0.9f, topK=40))
             inferenceTimedOut = false
             onStatus("LOCAL • Qwen2.5 7B พร้อมใช้งาน")
             true
@@ -75,119 +70,83 @@ class LocalBrain(private val context: Context) {
             client.newCall(req).execute().use { res ->
                 if (!res.isSuccessful) return@withContext false
                 val body = res.body ?: return@withContext false
-                val total = body.contentLength(); var done = 0L; var lastPercent = -1
-                body.byteStream().use { input -> FileOutputStream(tmp, false).use { out ->
-                    val buffer = ByteArray(1024 * 1024)
-                    while (true) {
-                        val n = input.read(buffer); if (n <= 0) break
-                        out.write(buffer, 0, n); done += n
-                        if (total > 0) {
-                            val p = ((done * 100) / total).toInt()
-                            if (p != lastPercent && (p % 2 == 0 || p == 100)) { lastPercent = p; onStatus("LOCAL • ติดตั้งสมอง 7B $p%") }
-                        }
+                val total = body.contentLength(); var done = 0L; var last = -1
+                body.byteStream().use { input -> FileOutputStream(tmp,false).use { out ->
+                    val buffer=ByteArray(1024*1024)
+                    while(true){ val n=input.read(buffer); if(n<=0) break; out.write(buffer,0,n); done+=n
+                        if(total>0){ val p=((done*100)/total).toInt(); if(p!=last && p%2==0){last=p; onStatus("LOCAL • ดาวน์โหลดสมอง 7B $p%")}}
                     }
                 }}
             }
-            if (tmp.length() < MIN_MODEL_BYTES) { tmp.delete(); return@withContext false }
-            if (target.exists()) target.delete()
-            if (!tmp.renameTo(target)) { tmp.copyTo(target, overwrite = true); tmp.delete() }
-            true
-        } catch (_: Throwable) { false }
+            if(tmp.length()<MIN_MODEL_BYTES){tmp.delete();return@withContext false}
+            if(target.exists())target.delete(); if(!tmp.renameTo(target)){tmp.copyTo(target,true);tmp.delete()}; true
+        } catch (_:Throwable){ false }
     }
 
-    suspend fun generate(message: String, memories: List<MemoryEntity>, cfg: NeoLiveConfig, extraContext: List<String> = emptyList(), onStatus: (String) -> Unit = {}): String = withContext(Dispatchers.IO) {
-        fastPath(message, memories)?.let { return@withContext it }
-        val webBlocks = extraContext.filter { it.startsWith("[WEB ") }
-        if (webBlocks.isNotEmpty()) return@withContext buildDirectWebAnswer(message, webBlocks)
+    suspend fun generate(message:String, memories:List<MemoryEntity>, cfg:NeoLiveConfig, extraContext:List<String> = emptyList(), onStatus:(String)->Unit = {}):String = withContext(Dispatchers.IO){
+        fastPath(message,memories)?.let{return@withContext it}
+        val webBlocks=extraContext.filter{it.startsWith("[WEB ")}
+        if(webBlocks.isNotEmpty()) return@withContext buildDirectWebAnswer(message,webBlocks)
+        if(inferenceTimedOut || !prepare(onStatus)) return@withContext searchFallback(message,memories,extraContext,onStatus)
 
-        if (inferenceTimedOut || !prepare(onStatus)) return@withContext searchFallback(message, memories, extraContext, onStatus)
-
-        val memoryText = memories.take(6).joinToString("\n") { "[${it.category} | p${it.importance}] ${it.text.take(220)}" }
-        val contextText = extraContext.take(3).joinToString("\n\n") { it.take(450) }
-        val system = buildString {
-            append(cfg.systemPrompt.take(1800))
-            append("\nคุณชื่อ NEO เป็นผู้ช่วย AI ส่วนตัว")
-            append("\nตอบในภาษาเดียวกับผู้ใช้โดยอัตโนมัติ รองรับหลายภาษา")
-            append("\nให้ใช้ความรู้พื้นฐานในโมเดลก่อน ใช้ Memory เฉพาะข้อมูลส่วนตัว และ Knowledge สำหรับข้อมูลที่เรียนรู้/เอกสาร")
-            append("\nถ้าคำถามต้องใช้ข้อมูลปัจจุบัน หรือไม่มั่นใจ ให้ตอบเพียง [[NEED_WEB]]")
-            append("\nห้ามเดาข้อเท็จจริง")
-            if (memoryText.isNotBlank()) append("\nMEMORY:\n$memoryText")
-            if (contextText.isNotBlank()) append("\nRAG:\n$contextText")
+        val memoryText=memories.take(4).joinToString("\n"){"[${it.category}] ${it.text.take(180)}"}
+        val contextText=extraContext.take(3).joinToString("\n\n"){it.take(350)}
+        val system=buildString{
+            append(cfg.systemPrompt.take(1200))
+            append("\nคุณชื่อ NEO ตอบภาษาเดียวกับผู้ใช้")
+            append("\nตอบสั้น ชัด เข้าใจง่าย ปกติ 1-3 ประโยค ถ้าผู้ใช้ไม่ได้ขอรายละเอียดห้ามตอบยาว")
+            append("\nใช้ความรู้ในโมเดลก่อน Memory ใช้เฉพาะข้อมูลผู้ใช้ Knowledge ใช้เมื่อเกี่ยวข้อง")
+            append("\nถ้าเป็นข้อมูลสดหรือไม่มั่นใจให้ตอบ [[NEED_WEB]] เท่านั้น")
+            if(memoryText.isNotBlank()) append("\nMEMORY:\n$memoryText")
+            if(contextText.isNotBlank()) append("\nKNOWLEDGE:\n$contextText")
         }
-        val current = model ?: return@withContext searchFallback(message, memories, extraContext, onStatus)
+        val current=model ?: return@withContext searchFallback(message,memories,extraContext,onStatus)
         onStatus("LOCAL • NEO กำลังคิด…")
-        val future = inferenceExecutor.submit<String> { runBlocking {
-            Llama.complete(model = current, prompt = message.take(900), systemPrompt = system.take(5000), maxTokens = cfg.maxTokens.coerceIn(64, 160)).text.trim()
-        }}
-        try {
-            val answer = future.get(INFERENCE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-            if (answer.isBlank() || answer.contains("[[NEED_WEB]]")) {
-                onStatus("WEB • Local ไม่มั่นใจ กำลังค้นอัตโนมัติ…")
-                searchFallback(message, memories, extraContext, onStatus)
-            } else {
-                onStatus("LOCAL • Qwen2.5 7B พร้อมใช้งาน")
-                answer
-            }
-        } catch (_: TimeoutException) {
-            inferenceTimedOut = true; future.cancel(true)
-            searchFallback(message, memories, extraContext, onStatus)
-        } catch (_: Throwable) {
-            future.cancel(true)
-            searchFallback(message, memories, extraContext, onStatus)
-        }
+        val future=inferenceExecutor.submit<String>{runBlocking{Llama.complete(current,message.take(700),system.take(4000),maxTokens=cfg.maxTokens.coerceIn(48,120)).text.trim()}}
+        try{
+            val ans=future.get(INFERENCE_TIMEOUT_SECONDS,TimeUnit.SECONDS)
+            if(ans.isBlank()||ans.contains("[[NEED_WEB]]")) searchFallback(message,memories,extraContext,onStatus) else ans
+        }catch(_:TimeoutException){inferenceTimedOut=true;future.cancel(true);searchFallback(message,memories,extraContext,onStatus)}
+        catch(_:Throwable){future.cancel(true);searchFallback(message,memories,extraContext,onStatus)}
     }
 
-    private suspend fun searchFallback(message: String, memories: List<MemoryEntity>, extraContext: List<String>, onStatus: (String) -> Unit): String {
-        if (webSearch.canFallbackSearch(message)) {
-            onStatus("WEB • NEO ไม่แน่ใจ กำลังค้นหาคำตอบ…")
-            val packet = webSearch.search(message)
-            if (packet.results.isNotEmpty()) {
-                // Continual learning: verified retrieved snippets are added to local Knowledge.
-                packet.results.take(5).forEach { r ->
-                    runCatching { knowledgeHub.learnWeb(r.title, r.snippet, r.url) }
-                }
-                onStatus("LEARN • บันทึกความรู้ใหม่ ${packet.results.take(5).size} แหล่ง")
-                return buildDirectWebAnswer(message, packet.results.take(5).mapIndexed { i, r -> "[WEB ${i+1}: ${r.title}]\n${r.snippet}\nSOURCE: ${r.url}" })
+    private suspend fun searchFallback(message:String,memories:List<MemoryEntity>,extraContext:List<String>,onStatus:(String)->Unit):String{
+        if(webSearch.canFallbackSearch(message)){
+            onStatus("WEB • กำลังค้นข้อมูลที่เกี่ยวข้อง…")
+            val p=webSearch.search(message)
+            if(p.results.isNotEmpty()){
+                p.results.take(3).forEach{r->runCatching{knowledgeHub.learnWeb(r.title,r.snippet,r.url)}}
+                return buildDirectWebAnswer(message,p.results.take(3).mapIndexed{i,r->"[WEB ${i+1}: ${r.title}]\n${r.snippet}\nSOURCE: ${r.url}"})
             }
         }
-        if (extraContext.isNotEmpty()) return "จาก Knowledge ที่มี:\n" + extraContext.take(3).joinToString("\n\n") { it.take(500) }
-        if (memories.isNotEmpty() && message.contains("จำ")) return "จากความจำที่เกี่ยวข้อง:\n" + memories.take(4).joinToString("\n") { "• ${it.text.take(300)}" }
+        if(extraContext.isNotEmpty()) return extraContext.first().substringAfter(']').trim().take(350)
+        if(memories.isNotEmpty() && message.contains("จำ")) return "ผมจำได้ว่า ${memories.first().text.take(220)}"
         return "ตอนนี้ผมยังหาคำตอบที่มั่นใจไม่ได้ครับ"
     }
 
-    private fun fastPath(message: String, memories: List<MemoryEntity>): String? {
-        val q = message.lowercase().trim()
-        if (q.contains("นายชื่ออะไร") || q.contains("ชื่อของนาย") || q.contains("what is your name")) return "ผมชื่อ NEO ครับ เป็นผู้ช่วย AI ส่วนตัวของคุณ"
-        if (memories.isNotEmpty() && (q.contains("จำอะไร") || q.contains("ข้อมูลที่จำ") || q.contains("what do you remember"))) {
-            val selected = memories.take(5).map { it.text.trim() }.filter { it.isNotBlank() }
-            if (selected.isNotEmpty()) return "ข้อมูลที่ผมจำได้ตอนนี้:\n" + selected.joinToString("\n") { "• $it" }
-        }
+    private fun fastPath(message:String,memories:List<MemoryEntity>):String?{
+        val q=message.lowercase().trim()
+        if(q.contains("นายชื่ออะไร")||q.contains("ชื่อของนาย")||q.contains("what is your name")) return "ผมชื่อ NEO ครับ"
+        if(memories.isNotEmpty()&&(q.contains("จำอะไร")||q.contains("ข้อมูลที่จำ"))) return "ผมจำได้ว่า ${memories.take(3).joinToString(" / "){it.text.take(100)}}"
         return null
     }
 
-    private fun buildDirectWebAnswer(message: String, webBlocks: List<String>): String {
-        val items = webBlocks.take(5).mapNotNull { block ->
-            val lines = block.lines().filter { it.isNotBlank() }; if (lines.isEmpty()) return@mapNotNull null
-            val title = lines.first().substringAfter(":", lines.first()).substringBeforeLast("]").trim()
-            val source = lines.firstOrNull { it.startsWith("SOURCE:") }?.removePrefix("SOURCE:")?.trim().orEmpty()
-            val snippet = lines.filterNot { it.startsWith("[WEB ") || it.startsWith("SOURCE:") }.joinToString(" ").replace(Regex("\\s+"), " ").trim().take(600)
-            Triple(title, snippet, source)
-        }
-        if (items.isEmpty()) return "ค้นเว็บแล้ว แต่ยังไม่พบข้อมูลที่ใช้ตอบได้ครับ"
-        return buildString {
-            append("จากข้อมูลที่ค้นได้:\n\n")
-            items.forEachIndexed { i, (title, snippet, source) ->
-                append("${i+1}. $title")
-                if (snippet.isNotBlank()) append("\n$snippet")
-                if (source.isNotBlank()) append("\nแหล่งข้อมูล: $source")
-                if (i != items.lastIndex) append("\n\n")
+    private fun buildDirectWebAnswer(message:String,webBlocks:List<String>):String{
+        val q=message.lowercase()
+        val items=webBlocks.take(3).mapNotNull{b->
+            val lines=b.lines().filter{it.isNotBlank()}; if(lines.isEmpty()) null else {
+                val title=lines.first().substringAfter(":",lines.first()).substringBeforeLast("]").trim()
+                val snippet=lines.filterNot{it.startsWith("[WEB ")||it.startsWith("SOURCE:")}.joinToString(" ").replace(Regex("\\s+")," ").trim()
+                title to snippet
             }
         }
+        if(items.isEmpty()) return "ยังไม่พบข้อมูลที่ตรงกับคำถามครับ"
+        if(listOf("dollar","ดอลลาร์","usd","ค่าเงิน","อัตราแลกเปลี่ยน","บาท").any{q.contains(it)}) return items.first().second.take(120)
+        if(listOf("ข่าว","news","ล่าสุด","อัปเดต").any{q.contains(it)}){
+            return "ข่าวล่าสุดที่พบ:\n" + items.take(3).mapIndexed{i,(t,_)->"${i+1}. ${t.take(100)}"}.joinToString("\n")
+        }
+        return items.first().second.take(320).ifBlank{items.first().first}
     }
 
-    fun release() {
-        inferenceExecutor.shutdownNow()
-        if (!inferenceTimedOut) model?.let { runCatching { Llama.releaseModel(it) } }
-        model = null
-    }
+    fun release(){inferenceExecutor.shutdownNow();if(!inferenceTimedOut)model?.let{runCatching{Llama.releaseModel(it)}};model=null}
 }
