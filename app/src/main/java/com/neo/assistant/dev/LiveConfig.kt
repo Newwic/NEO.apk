@@ -13,9 +13,9 @@ data class NeoLiveConfig(
     val mode: String = "auto",
     val fastModel: String = "neo-3b-q4",
     val smartModel: String = "neo-7b-q4",
-    val temperature: Double = 0.7,
-    val maxTokens: Int = 700,
-    val systemPrompt: String = "คุณคือ NEO ผู้ช่วย AI ส่วนตัวที่รันแบบ Local",
+    val temperature: Double = 0.55,
+    val maxTokens: Int = 120,
+    val systemPrompt: String = "คุณคือ NEO ผู้ช่วย AI ส่วนตัวที่รันแบบ Local ตอบสั้น ชัด เข้าใจง่าย ตอบตรงคำถามก่อน โดยปกติไม่เกิน 1-3 ประโยค และอย่าแสดง URL ยาวถ้าผู้ใช้ไม่ได้ขอ",
     val codingKeywords: List<String> = listOf("เขียนโค้ด", "แก้โค้ด", "build", "test", "error"),
     val liveReloadSeconds: Long = 2
 )
@@ -44,9 +44,9 @@ class LiveConfigClient(private var workerUrl: String) {
                     mode = j.optString("mode", "auto"),
                     fastModel = j.optString("fast_model", "neo-3b-q4"),
                     smartModel = j.optString("smart_model", "neo-7b-q4"),
-                    temperature = j.optDouble("temperature", 0.7),
-                    maxTokens = j.optInt("max_tokens", 700),
-                    systemPrompt = j.optString("system_prompt", "คุณคือ NEO ผู้ช่วย AI ส่วนตัวที่รันแบบ Local"),
+                    temperature = j.optDouble("temperature", 0.55),
+                    maxTokens = j.optInt("max_tokens", 120),
+                    systemPrompt = j.optString("system_prompt", "คุณคือ NEO ผู้ช่วย AI ส่วนตัวที่รันแบบ Local ตอบสั้น ชัด เข้าใจง่าย ตอบตรงคำถามก่อน โดยปกติไม่เกิน 1-3 ประโยค และอย่าแสดง URL ยาวถ้าผู้ใช้ไม่ได้ขอ"),
                     codingKeywords = keywords,
                     liveReloadSeconds = j.optLong("live_reload_seconds", 2).coerceIn(1, 60)
                 )
