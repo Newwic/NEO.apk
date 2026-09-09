@@ -2,7 +2,9 @@ package com.neo.assistant.ai
 
 import android.content.Context
 import com.neo.assistant.dev.NeoLiveConfig
+import com.neo.assistant.knowledge.KnowledgeHub
 import com.neo.assistant.memory.MemoryEntity
+import com.neo.assistant.memory.NeoDatabase
 import com.neo.assistant.web.WebSearchClient
 import dev.ffmpegkit.llama.Llama
 import dev.ffmpegkit.llama.LlamaConfig
@@ -32,6 +34,7 @@ class LocalBrain(private val context: Context) {
     private val client = OkHttpClient.Builder().connectTimeout(30, TimeUnit.SECONDS).readTimeout(0, TimeUnit.SECONDS).build()
     private val inferenceExecutor = Executors.newSingleThreadExecutor()
     private val webSearch = WebSearchClient()
+    private val knowledgeHub = KnowledgeHub(NeoDatabase.get(context).appDataDao())
     @Volatile private var model: LlamaModel? = null
     @Volatile private var inferenceTimedOut = false
 
@@ -103,12 +106,11 @@ class LocalBrain(private val context: Context) {
         val contextText = extraContext.take(3).joinToString("\n\n") { it.take(450) }
         val system = buildString {
             append(cfg.systemPrompt.take(1800))
-            append("\nคุณชื่อ NEO เป็นผู้ช่วย AI ส่วนตัว ตอบภาษาไทยเป็นหลัก")
-            append("\nให้คิดและใช้ความรู้พื้นฐานที่มีอยู่ในโมเดลก่อน ไม่ต้องพึ่ง Memory สำหรับความรู้ทั่วไป")
-            append("\nแยกให้ชัด: Memory คือข้อมูลส่วนตัวของผู้ใช้, Knowledge คือเอกสาร, ความรู้ทั่วไปให้ใช้ความรู้ของโมเดล")
-            append("\nตอบคำถามตรง ๆ และให้เหตุผลภายในก่อนตอบ ห้ามแสดง chain-of-thought ยาว ๆ")
-            append("\nถ้าคำถามต้องใช้ข้อมูลปัจจุบัน/ราคา/ข่าว หรือคุณไม่มั่นใจจริง ๆ ให้ตอบเพียง [[NEED_WEB]]")
-            append("\nห้ามเดาตัวเลขหรือข้อเท็จจริงเมื่อไม่รู้")
+            append("\nคุณชื่อ NEO เป็นผู้ช่วย AI ส่วนตัว")
+            append("\nตอบในภาษาเดียวกับผู้ใช้โดยอัตโนมัติ รองรับหลายภาษา")
+            append("\nให้ใช้ความรู้พื้นฐานในโมเดลก่อน ใช้ Memory เฉพาะข้อมูลส่วนตัว และ Knowledge สำหรับข้อมูลที่เรียนรู้/เอกสาร")
+            append("\nถ้าคำถามต้องใช้ข้อมูลปัจจุบัน หรือไม่มั่นใจ ให้ตอบเพียง [[NEED_WEB]]")
+            append("\nห้ามเดาข้อเท็จจริง")
             if (memoryText.isNotBlank()) append("\nMEMORY:\n$memoryText")
             if (contextText.isNotBlank()) append("\nRAG:\n$contextText")
         }
@@ -140,7 +142,11 @@ class LocalBrain(private val context: Context) {
             onStatus("WEB • NEO ไม่แน่ใจ กำลังค้นหาคำตอบ…")
             val packet = webSearch.search(message)
             if (packet.results.isNotEmpty()) {
-                onStatus("WEB • พบข้อมูล ${packet.results.size} แหล่ง")
+                // Continual learning: verified retrieved snippets are added to local Knowledge.
+                packet.results.take(5).forEach { r ->
+                    runCatching { knowledgeHub.learnWeb(r.title, r.snippet, r.url) }
+                }
+                onStatus("LEARN • บันทึกความรู้ใหม่ ${packet.results.take(5).size} แหล่ง")
                 return buildDirectWebAnswer(message, packet.results.take(5).mapIndexed { i, r -> "[WEB ${i+1}: ${r.title}]\n${r.snippet}\nSOURCE: ${r.url}" })
             }
         }
@@ -151,8 +157,8 @@ class LocalBrain(private val context: Context) {
 
     private fun fastPath(message: String, memories: List<MemoryEntity>): String? {
         val q = message.lowercase().trim()
-        if (q.contains("นายชื่ออะไร") || q.contains("ชื่อของนาย")) return "ผมชื่อ NEO ครับ เป็นผู้ช่วย AI ส่วนตัวของคุณ"
-        if (memories.isNotEmpty() && (q.contains("จำอะไร") || q.contains("ข้อมูลที่จำ"))) {
+        if (q.contains("นายชื่ออะไร") || q.contains("ชื่อของนาย") || q.contains("what is your name")) return "ผมชื่อ NEO ครับ เป็นผู้ช่วย AI ส่วนตัวของคุณ"
+        if (memories.isNotEmpty() && (q.contains("จำอะไร") || q.contains("ข้อมูลที่จำ") || q.contains("what do you remember"))) {
             val selected = memories.take(5).map { it.text.trim() }.filter { it.isNotBlank() }
             if (selected.isNotEmpty()) return "ข้อมูลที่ผมจำได้ตอนนี้:\n" + selected.joinToString("\n") { "• $it" }
         }
