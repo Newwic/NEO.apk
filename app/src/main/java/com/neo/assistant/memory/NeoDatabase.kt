@@ -12,7 +12,8 @@ import com.neo.assistant.data.KnowledgeEntity
 
 @Database(
     entities = [MemoryEntity::class, ChatEntity::class, KnowledgeEntity::class],
-    version = 3
+    version = 3,
+    exportSchema = false
 )
 abstract class NeoDatabase : RoomDatabase() {
     abstract fun memoryDao(): MemoryDao
