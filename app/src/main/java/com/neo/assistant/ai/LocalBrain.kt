@@ -116,18 +116,25 @@ class LocalBrain(private val context: Context) {
         }
     }
 
-    suspend fun generate(message: String, memories: List<MemoryEntity>, cfg: NeoLiveConfig): String {
+    suspend fun generate(
+        message: String,
+        memories: List<MemoryEntity>,
+        cfg: NeoLiveConfig,
+        extraContext: List<String> = emptyList()
+    ): String {
         if (!prepare()) return "ยังติดตั้งสมอง Local 7B ไม่สำเร็จครับ ต้องมีพื้นที่ว่างอย่างน้อยประมาณ 6 GB และ RAM ว่างพอ"
 
         val memoryText = memories.joinToString("\n") {
             "[${it.category} | ${it.source}→${it.destination} | p${it.importance}] ${it.text}"
         }
+        val contextText = extraContext.take(10).joinToString("\n\n")
         val system = buildString {
             append(cfg.systemPrompt)
             append("\nคุณชื่อ NEO เป็นผู้ช่วยส่วนตัวของผู้ใช้ ตอบภาษาไทยเป็นหลัก เว้นแต่ผู้ใช้ขอภาษาอื่น")
-            append("\nคุณทำงานบนมือถือแบบ Local โดยไม่ต้องใช้ Cloud inference")
-            append("\nใช้ความจำด้านล่างเฉพาะส่วนที่เกี่ยวข้อง และให้ความสำคัญกับข้อมูลที่มาจากผู้ใช้โดยตรง")
+            append("\nคุณทำงานบนมือถือแบบ Local และสามารถใช้ Memory, Local Knowledge และผลค้นเว็บที่ระบบส่งมาให้")
+            append("\nห้ามแต่งข้อมูลจากแหล่งข้อมูล หากข้อมูลไม่พอให้บอกตรง ๆ")
             if (memoryText.isNotBlank()) append("\n\nMEMORY ROUTE DATA:\n$memoryText")
+            if (contextText.isNotBlank()) append("\n\nRAG / WEB CONTEXT:\n$contextText")
         }
 
         return try {
