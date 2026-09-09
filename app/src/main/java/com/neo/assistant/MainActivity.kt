@@ -36,6 +36,7 @@ class MainActivity : ComponentActivity() {
     @Volatile private var liveConfig = NeoLiveConfig()
     private var submitMessage: ((String) -> Unit)? = null
     private var updateStatus: ((String) -> Unit)? = null
+    private var lastBrainStatus: String = "LOCAL • เตรียมสมอง 3B"
 
     private val speechLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         if (result.resultCode == Activity.RESULT_OK) {
@@ -47,15 +48,19 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         neoTts = NeoTts(this)
         settings = NeoSettings(this)
-        brain = LocalBrain(settings.brainUrl)
+        brain = LocalBrain(this)
         liveClient = LiveConfigClient(settings.pcWorkerUrl)
+
+        lifecycleScope.launch {
+            delay(500)
+            brain.prepare(::setBrainStatus)
+        }
 
         lifecycleScope.launch {
             while (isActive) {
                 liveClient.fetch()?.let { cfg ->
                     if (cfg.revision != liveConfig.revision) {
                         liveConfig = cfg
-                        updateStatus?.invoke("LIVE • config r${cfg.revision} • ${cfg.mode.uppercase()}")
                     }
                 }
                 delay(liveConfig.liveReloadSeconds * 1000)
@@ -65,21 +70,27 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme {
                 NeoScreen(
-                    initialBrainUrl = settings.brainUrl,
                     initialPcUrl = settings.pcWorkerUrl,
-                    onSaveSettings = { brainUrl, pcUrl ->
-                        settings.brainUrl = brainUrl
+                    onSaveSettings = { pcUrl ->
                         settings.pcWorkerUrl = pcUrl
-                        brain.setBaseUrl(brainUrl)
                         liveClient.setWorkerUrl(pcUrl)
                     },
                     onSend = ::onUserMessage,
                     onMic = { speechLauncher.launch(NeoSpeechRecognizer.intent()) },
+                    onInstallBrain = { lifecycleScope.launch { brain.prepare(::setBrainStatus) } },
                     registerSubmitter = { submitMessage = it },
-                    registerStatus = { updateStatus = it }
+                    registerStatus = {
+                        updateStatus = it
+                        it(lastBrainStatus)
+                    }
                 )
             }
         }
+    }
+
+    private fun setBrainStatus(text: String) {
+        lastBrainStatus = text
+        runOnUiThread { updateStatus?.invoke(text) }
     }
 
     private fun onUserMessage(text: String) {
@@ -101,11 +112,18 @@ class MainActivity : ComponentActivity() {
 
             val cfg = liveConfig
             val isCodingTask = cfg.codingKeywords.any { text.contains(it, ignoreCase = true) }
-            if (isCodingTask) {
-                reply(PcWorkerClient(settings.pcWorkerUrl).runTask(text))
-                return@launch
+            if (isCodingTask && settings.pcWorkerUrl.isNotBlank()) {
+                val pcResult = PcWorkerClient(settings.pcWorkerUrl).runTask(text)
+                if (!pcResult.contains("เชื่อม", ignoreCase = true) && !pcResult.contains("ไม่ได้", ignoreCase = true)) {
+                    reply(pcResult)
+                    return@launch
+                }
             }
-            reply(brain.generate(text, dao.recent().map { it.text }, cfg))
+
+            setBrainStatus("LOCAL • NEO กำลังคิด…")
+            val answer = brain.generate(text, dao.recent().map { it.text }, cfg)
+            setBrainStatus("LOCAL • Qwen2.5 3B พร้อมใช้งาน")
+            reply(answer)
         }
     }
 
@@ -115,6 +133,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        brain.release()
         neoTts.shutdown()
         super.onDestroy()
     }
@@ -123,20 +142,19 @@ class MainActivity : ComponentActivity() {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun NeoScreen(
-    initialBrainUrl: String,
     initialPcUrl: String,
-    onSaveSettings: (String, String) -> Unit,
+    onSaveSettings: (String) -> Unit,
     onSend: (String) -> Unit,
     onMic: () -> Unit,
+    onInstallBrain: () -> Unit,
     registerSubmitter: (((String) -> Unit) -> Unit),
     registerStatus: (((String) -> Unit) -> Unit)
 ) {
     val messages = remember { mutableStateListOf("NEO: พร้อมใช้งาน • Local First") }
     var input by remember { mutableStateOf("") }
     var showSettings by remember { mutableStateOf(false) }
-    var brainUrl by remember { mutableStateOf(initialBrainUrl) }
     var pcUrl by remember { mutableStateOf(initialPcUrl) }
-    var status by remember { mutableStateOf("LOCAL • waiting config") }
+    var status by remember { mutableStateOf("LOCAL • เตรียมสมอง 3B") }
 
     LaunchedEffect(Unit) {
         registerSubmitter { messages.add(it) }
@@ -149,16 +167,18 @@ fun NeoScreen(
             title = { Text("NEO Local Settings") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text("llama.cpp บนมือถือ")
-                    OutlinedTextField(brainUrl, { brainUrl = it }, label = { Text("Brain URL") })
-                    Text("PC Worker / Live Reload")
+                    Text("สมอง: Qwen2.5 3B Q4 • llama.cpp • ทำงานในมือถือ")
+                    Button(onClick = onInstallBrain, modifier = Modifier.fillMaxWidth()) {
+                        Text("ติดตั้ง / โหลดสมอง Local 3B")
+                    }
+                    Text("PC Worker / Live Reload (ไม่จำเป็นสำหรับแชต Local)")
                     OutlinedTextField(pcUrl, { pcUrl = it }, label = { Text("PC Worker URL") })
-                    Text("แก้ config/neo-config.json บน PC แล้วมือถือจะอัปเดตเอง")
+                    Text("หลังดาวน์โหลดโมเดลครั้งแรกประมาณ 1.9 GB สามารถคุยกับ NEO แบบออฟไลน์ได้")
                 }
             },
             confirmButton = {
                 Button(onClick = {
-                    onSaveSettings(brainUrl, pcUrl)
+                    onSaveSettings(pcUrl)
                     showSettings = false
                 }) { Text("บันทึก") }
             },
@@ -177,9 +197,7 @@ fun NeoScreen(
                         Text(status, style = MaterialTheme.typography.labelSmall)
                     }
                 },
-                actions = {
-                    IconButton(onClick = { showSettings = true }) { Text("⚙") }
-                }
+                actions = { IconButton(onClick = { showSettings = true }) { Text("⚙") } }
             )
         }
     ) { padding ->
@@ -189,9 +207,7 @@ fun NeoScreen(
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 items(messages) {
-                    Card(Modifier.fillMaxWidth()) {
-                        Text(it, Modifier.padding(12.dp))
-                    }
+                    Card(Modifier.fillMaxWidth()) { Text(it, Modifier.padding(12.dp)) }
                 }
             }
 
@@ -217,9 +233,7 @@ fun NeoScreen(
                     }
                 },
                 modifier = Modifier.fillMaxWidth()
-            ) {
-                Text("ส่ง")
-            }
+            ) { Text("ส่ง") }
         }
     }
 }
