@@ -5,7 +5,7 @@ import kotlinx.coroutines.coroutineScope
 
 /**
  * Structured local memory router.
- * Multiple retrieval lanes run in parallel, then merge/rank into one packet for the brain.
+ * Supports multilingual text and a growing local memory store.
  */
 class MemoryHub(private val dao: MemoryDao) {
 
@@ -16,27 +16,29 @@ class MemoryHub(private val dao: MemoryDao) {
     )
 
     suspend fun save(text: String, source: String = "user", destination: String = "brain") {
-        val category = classify(text)
+        val clean = text.trim()
+        if (clean.isBlank()) return
+        val category = classify(clean)
         dao.insert(
             MemoryEntity(
-                text = text.trim(),
+                text = clean,
                 category = category,
                 source = source,
                 destination = destination,
-                keywords = tokenize(text).joinToString(" "),
-                importance = importance(text, category)
+                keywords = tokenize(clean).take(120).joinToString(" "),
+                importance = importance(clean, category)
             )
         )
     }
 
-    suspend fun retrieve(query: String, limit: Int = 12): Packet = coroutineScope {
+    suspend fun retrieve(query: String, limit: Int = 16): Packet = coroutineScope {
         val started = System.currentTimeMillis()
         val category = classify(query)
 
-        // Three independent lanes fetch in parallel: recent, semantic category, and user-origin data.
-        val recentLane = async { dao.recent(120) }
-        val categoryLane = async { dao.byCategory(category, 100) }
-        val sourceLane = async { dao.bySource("user", 100) }
+        // Larger lanes keep retrieval useful as the database grows over time.
+        val recentLane = async { dao.recent(300) }
+        val categoryLane = async { dao.byCategory(category, 250) }
+        val sourceLane = async { dao.bySource("user", 250) }
 
         val queryTokens = tokenize(query)
         val merged = (recentLane.await() + categoryLane.await() + sourceLane.await())
@@ -52,7 +54,7 @@ class MemoryHub(private val dao: MemoryDao) {
 
         Packet(
             memories = merged,
-            route = "user + recent + $category → memory-hub → brain",
+            route = "multilingual + recent + $category → memory-hub → brain",
             elapsedMs = System.currentTimeMillis() - started
         )
     }
@@ -64,17 +66,17 @@ class MemoryHub(private val dao: MemoryDao) {
         if (memory.category == category) score += 30
         if (memory.source == "user") score += 10
         score += memory.importance / 5
-        score += memory.accessCount.coerceAtMost(20)
+        score += memory.accessCount.coerceAtMost(30)
         return score
     }
 
     private fun classify(text: String): String {
         val t = text.lowercase()
         return when {
-            listOf("rpv", "สินค้า", "ลูกค้า", "บริษัท", "ขาย", "quotation", "po").any { t.contains(it) } -> "work"
-            listOf("code", "โค้ด", "android", "github", "program", "โปรแกรม", "debug").any { t.contains(it) } -> "coding"
-            listOf("จำ", "ชอบ", "ไม่ชอบ", "ชื่อ", "อายุ", "เป้าหมาย", "ของผม").any { t.contains(it) } -> "profile"
-            listOf("งาน", "ทำ", "todo", "เตือน", "task", "โปรเจกต์").any { t.contains(it) } -> "task"
+            listOf("rpv", "สินค้า", "ลูกค้า", "บริษัท", "ขาย", "quotation", "purchase order", "business", "customer", "company", "sales", "empresa", "cliente", "entreprise", "client", "会社", "顧客", "公司", "客户").any { t.contains(it) } -> "work"
+            listOf("code", "โค้ด", "android", "github", "program", "โปรแกรม", "debug", "coding", "python", "java", "kotlin", "程序", "代码", "プログラム", "コード").any { t.contains(it) } -> "coding"
+            listOf("จำ", "ชอบ", "ไม่ชอบ", "ชื่อ", "อายุ", "เป้าหมาย", "ของผม", "remember", "my name", "i like", "i dislike", "my goal", "me llamo", "mi nombre", "j'aime", "je m'appelle", "ich heiße", "mein name", "私の名前", "覚えて", "我叫", "记住").any { t.contains(it) } -> "profile"
+            listOf("งาน", "ทำ", "todo", "เตือน", "task", "โปรเจกต์", "project", "remind", "任务", "项目", "タスク", "プロジェクト").any { t.contains(it) } -> "task"
             else -> "general"
         }
     }
@@ -87,15 +89,17 @@ class MemoryHub(private val dao: MemoryDao) {
             "task" -> 85
             else -> 55
         }
-        if (text.contains("สำคัญ") || text.contains("จำไว้")) value += 10
+        val t = text.lowercase()
+        if (listOf("สำคัญ", "จำไว้", "important", "remember this", "重要", "重要です").any { t.contains(it) }) value += 10
         return value.coerceIn(1, 100)
     }
 
+    /** Unicode letters/numbers keeps Thai, English, Chinese, Japanese, Korean and most languages searchable. */
     private fun tokenize(text: String): Set<String> = text
         .lowercase()
         .replace(Regex("[^\\p{L}\\p{N}_]+"), " ")
         .split(' ')
         .map { it.trim() }
-        .filter { it.length >= 2 }
+        .filter { it.length >= 1 }
         .toSet()
 }
