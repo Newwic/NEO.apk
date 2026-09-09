@@ -2,6 +2,7 @@ package com.neo.assistant.ai
 
 import android.content.Context
 import com.neo.assistant.dev.NeoLiveConfig
+import com.neo.assistant.memory.MemoryEntity
 import dev.ffmpegkit.llama.Llama
 import dev.ffmpegkit.llama.LlamaConfig
 import dev.ffmpegkit.llama.LlamaModel
@@ -17,9 +18,9 @@ import java.util.concurrent.TimeUnit
 
 class LocalBrain(private val context: Context) {
     companion object {
-        private const val MODEL_FILE = "Qwen2.5-3B-Instruct-Q4_K_M.gguf"
-        private const val MODEL_URL = "https://huggingface.co/lmstudio-community/Qwen2.5-3B-Instruct-GGUF/resolve/main/Qwen2.5-3B-Instruct-Q4_K_M.gguf?download=true"
-        private const val MIN_MODEL_BYTES = 1_800_000_000L
+        private const val MODEL_FILE = "Qwen2.5-7B-Instruct-Q4_K_M.gguf"
+        private const val MODEL_URL = "https://huggingface.co/lmstudio-community/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_K_M.gguf?download=true"
+        private const val MIN_MODEL_BYTES = 4_000_000_000L
     }
 
     private val mutex = Mutex()
@@ -28,9 +29,6 @@ class LocalBrain(private val context: Context) {
         .readTimeout(0, TimeUnit.SECONDS)
         .build()
     private var model: LlamaModel? = null
-
-    @Suppress("UNUSED_PARAMETER")
-    fun setBaseUrl(url: String) { /* kept for compatibility: local engine no longer uses HTTP */ }
 
     fun modelFile(): File {
         val dir = context.getExternalFilesDir("models") ?: File(context.filesDir, "models")
@@ -46,22 +44,22 @@ class LocalBrain(private val context: Context) {
             if (!ok) return@withLock false
         }
         return@withLock try {
-            onStatus("LOCAL • กำลังโหลดสมอง 3B…")
+            onStatus("LOCAL • กำลังโหลดสมอง 7B…")
             model = Llama.loadModel(
                 modelPath = file.absolutePath,
                 config = LlamaConfig(
-                    contextSize = 3072,
-                    threads = Runtime.getRuntime().availableProcessors().coerceIn(4, 8),
+                    contextSize = 2048,
+                    threads = Runtime.getRuntime().availableProcessors().coerceIn(4, 6),
                     gpuLayers = 0,
-                    temperature = 0.65f,
+                    temperature = 0.62f,
                     topP = 0.9f,
                     topK = 40
                 )
             )
-            onStatus("LOCAL • Qwen2.5 3B พร้อมใช้งาน")
+            onStatus("LOCAL • Qwen2.5 7B พร้อมใช้งาน")
             true
-        } catch (e: Exception) {
-            onStatus("LOCAL • โหลดโมเดลไม่สำเร็จ")
+        } catch (_: Exception) {
+            onStatus("LOCAL • โหลด 7B ไม่สำเร็จ • เช็ก RAM/พื้นที่")
             false
         }
     }
@@ -73,7 +71,7 @@ class LocalBrain(private val context: Context) {
             val req = Request.Builder().url(MODEL_URL).get().build()
             client.newCall(req).execute().use { res ->
                 if (!res.isSuccessful) {
-                    onStatus("LOCAL • ดาวน์โหลดสมองไม่สำเร็จ (${res.code})")
+                    onStatus("LOCAL • ดาวน์โหลด 7B ไม่สำเร็จ (${res.code})")
                     return@withContext false
                 }
                 val body = res.body ?: return@withContext false
@@ -92,7 +90,7 @@ class LocalBrain(private val context: Context) {
                                 val percent = ((done * 100) / total).toInt()
                                 if (percent != lastPercent && (percent % 2 == 0 || percent == 100)) {
                                     lastPercent = percent
-                                    onStatus("LOCAL • ติดตั้งสมอง 3B $percent%")
+                                    onStatus("LOCAL • ติดตั้งสมอง 7B $percent%")
                                 }
                             } else {
                                 onStatus("LOCAL • ติดตั้งสมอง ${(done / 1_048_576)} MB")
@@ -103,7 +101,7 @@ class LocalBrain(private val context: Context) {
             }
             if (tmp.length() < MIN_MODEL_BYTES) {
                 tmp.delete()
-                onStatus("LOCAL • ไฟล์โมเดลไม่สมบูรณ์")
+                onStatus("LOCAL • ไฟล์ 7B ไม่สมบูรณ์")
                 return@withContext false
             }
             if (target.exists()) target.delete()
@@ -113,27 +111,32 @@ class LocalBrain(private val context: Context) {
             }
             true
         } catch (_: Exception) {
-            onStatus("LOCAL • ดาวน์โหลดสมองขัดข้อง")
+            onStatus("LOCAL • ดาวน์โหลดสมอง 7B ขัดข้อง")
             false
         }
     }
 
-    suspend fun generate(message: String, memories: List<String>, cfg: NeoLiveConfig): String {
-        if (!prepare()) return "ยังติดตั้งสมอง Local ไม่สำเร็จครับ เช็กอินเทอร์เน็ตและพื้นที่ว่างประมาณ 3 GB แล้วลองใหม่"
-        val memoryText = memories.take(12).joinToString("\n")
+    suspend fun generate(message: String, memories: List<MemoryEntity>, cfg: NeoLiveConfig): String {
+        if (!prepare()) return "ยังติดตั้งสมอง Local 7B ไม่สำเร็จครับ ต้องมีพื้นที่ว่างอย่างน้อยประมาณ 6 GB และ RAM ว่างพอ"
+
+        val memoryText = memories.joinToString("\n") {
+            "[${it.category} | ${it.source}→${it.destination} | p${it.importance}] ${it.text}"
+        }
         val system = buildString {
             append(cfg.systemPrompt)
             append("\nคุณชื่อ NEO เป็นผู้ช่วยส่วนตัวของผู้ใช้ ตอบภาษาไทยเป็นหลัก เว้นแต่ผู้ใช้ขอภาษาอื่น")
             append("\nคุณทำงานบนมือถือแบบ Local โดยไม่ต้องใช้ Cloud inference")
-            if (memoryText.isNotBlank()) append("\n\nความจำที่เกี่ยวข้อง:\n$memoryText")
+            append("\nใช้ความจำด้านล่างเฉพาะส่วนที่เกี่ยวข้อง และให้ความสำคัญกับข้อมูลที่มาจากผู้ใช้โดยตรง")
+            if (memoryText.isNotBlank()) append("\n\nMEMORY ROUTE DATA:\n$memoryText")
         }
+
         return try {
             val current = model ?: return "สมอง Local ยังไม่พร้อมครับ"
             val result = Llama.complete(
                 model = current,
                 prompt = message,
                 systemPrompt = system,
-                maxTokens = cfg.maxTokens.coerceIn(64, 900)
+                maxTokens = cfg.maxTokens.coerceIn(64, 700)
             )
             result.text.trim().ifBlank { "ผมยังคิดคำตอบไม่ออกครับ ลองถามใหม่อีกครั้ง" }
         } catch (_: Exception) {
