@@ -5,6 +5,12 @@ object NeoIdentity {
         val q = input.lowercase().trim().replace(Regex("\\s+"), " ")
         if (q.isBlank()) return null
 
+        if (listOf("สวัสดี", "หวัดดี", "hello", "hi", "hey").any { q == it }) {
+            return "สวัสดีครับ ผม NEO พร้อมช่วยคุณครับ"
+        }
+        if (listOf("ขอบคุณ", "thanks", "thank you").any { q == it || q.contains(it) }) {
+            return "ยินดีครับ"
+        }
         if (listOf("นายชื่อ", "นายชื่ออะไร", "คุณชื่ออะไร", "ชื่อของนาย", "ชื่ออะไร", "what is your name").any { q == it || q.contains(it) }) {
             return "ผมชื่อ NEO ครับ เป็นผู้ช่วย AI ส่วนตัวของคุณ"
         }
@@ -22,6 +28,9 @@ object NeoIdentity {
         }
         if (listOf("ทำไรอยู่", "ทำอะไรอยู่", "ตอนนี้ทำอะไรอยู่").any { q.contains(it) }) {
             return "ตอนนี้ผมพร้อมคุยและช่วยคุณอยู่ครับ"
+        }
+        if (listOf("โอเค", "ok", "okay", "ได้", "เข้าใจแล้ว").any { q == it }) {
+            return "ครับ"
         }
         return null
     }
