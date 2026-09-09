@@ -21,21 +21,29 @@ class WebSearchClient {
         .build()
 
     fun shouldSearch(query: String): Boolean {
-        val t = query.lowercase()
+        val t = query.lowercase().trim()
         val dynamic = listOf(
             "ค้นเว็บ", "ค้นหาเว็บ", "search web", "วันนี้", "ตอนนี้", "ล่าสุด", "ข่าว", "ราคา",
-            "current", "latest", "today", "news", "update", "อัปเดต", "สด"
+            "current", "latest", "today", "news", "update", "อัปเดต", "สด", "เท่าไหร่วันนี้",
+            "อัตราแลกเปลี่ยน", "ค่าเงิน", "weather", "อากาศ", "หุ้น", "ทอง", "crypto", "bitcoin"
         )
         return dynamic.any { t.contains(it) }
+    }
+
+    /** Questions that are factual but not necessarily current. Used only as a fallback
+     * when local reasoning cannot produce a useful answer. */
+    fun canFallbackSearch(query: String): Boolean {
+        val t = query.trim()
+        if (t.length < 2) return false
+        val personalOnly = listOf("จำอะไร", "ผมชื่อ", "ฉันชื่อ", "ผมชอบ", "ข้อมูลของผม", "เปิดแอป")
+        return personalOnly.none { t.contains(it, ignoreCase = true) }
     }
 
     suspend fun search(query: String): Packet = coroutineScope {
         val started = System.currentTimeMillis()
         val ddg = async { searchDuckDuckGo(query) }
         val wiki = async { searchThaiWikipedia(query) }
-        val merged = (ddg.await() + wiki.await())
-            .distinctBy { it.url }
-            .take(7)
+        val merged = (ddg.await() + wiki.await()).distinctBy { it.url }.take(7)
         Packet(merged, System.currentTimeMillis() - started)
     }
 
@@ -50,9 +58,7 @@ class WebSearchClient {
                 val out = mutableListOf<Result>()
                 val abstract = json.optString("AbstractText")
                 val abstractUrl = json.optString("AbstractURL")
-                if (abstract.isNotBlank() && abstractUrl.isNotBlank()) {
-                    out += Result(json.optString("Heading", "DuckDuckGo"), abstract, abstractUrl)
-                }
+                if (abstract.isNotBlank() && abstractUrl.isNotBlank()) out += Result(json.optString("Heading", "DuckDuckGo"), abstract, abstractUrl)
                 collectTopics(json.optJSONArray("RelatedTopics"), out)
                 out.take(4)
             }
@@ -64,9 +70,7 @@ class WebSearchClient {
         for (i in 0 until array.length()) {
             val item = array.optJSONObject(i) ?: continue
             val nested = item.optJSONArray("Topics")
-            if (nested != null) {
-                collectTopics(nested, out)
-            } else {
+            if (nested != null) collectTopics(nested, out) else {
                 val text = item.optString("Text")
                 val url = item.optString("FirstURL")
                 if (text.isNotBlank() && url.isNotBlank()) out += Result(text.take(90), text, url)
