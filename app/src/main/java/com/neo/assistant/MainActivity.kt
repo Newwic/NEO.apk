@@ -28,6 +28,7 @@ import com.neo.assistant.memory.MemoryHub
 import com.neo.assistant.memory.NeoDatabase
 import com.neo.assistant.pc.PcWorkerClient
 import com.neo.assistant.tools.AppTools
+import com.neo.assistant.tools.LocalFacts
 import com.neo.assistant.voice.NeoSpeechRecognizer
 import com.neo.assistant.voice.NeoTts
 import com.neo.assistant.web.WebSearchClient
@@ -147,6 +148,12 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             appDataDao.insertChat(ChatEntity(role = "user", text = text))
 
+            LocalFacts.answer(text)?.let { direct ->
+                setBrainStatus("LOCAL • ตอบจากข้อมูลในเครื่อง")
+                replyAndStore(direct)
+                return@launch
+            }
+
             if (shouldRemember(text)) {
                 memoryHub.save(text, source = "user", destination = "brain")
             }
@@ -171,7 +178,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            setBrainStatus("ROUTER • Memory + Knowledge กำลังค้นพร้อมกัน…")
+            setBrainStatus("ROUTER • กำลังเลือกข้อมูลที่เกี่ยวข้อง…")
             val routed = coroutineScope {
                 val memory = async { memoryHub.retrieve(text) }
                 val knowledge = async { knowledgeHub.retrieve(text) }
@@ -201,13 +208,8 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            setBrainStatus(if (webPacket.results.isNotEmpty()) "WEB + RAG • NEO 7B กำลังคิด…" else "LOCAL RAG • NEO 7B กำลังคิด…")
-            var answer = brain.generate(text, memoryPacket.memories, cfg, extraContext)
-
-            if (webPacket.results.isNotEmpty()) {
-                val sources = webPacket.results.take(4).mapIndexed { i, it -> "${i + 1}. ${it.title} — ${it.url}" }
-                answer += "\n\nแหล่งข้อมูลเว็บ:\n" + sources.joinToString("\n")
-            }
+            setBrainStatus(if (webPacket.results.isNotEmpty()) "WEB • กำลังสรุปคำตอบ…" else "LOCAL • NEO 7B กำลังคิด…")
+            val answer = brain.generate(text, memoryPacket.memories, cfg, extraContext)
 
             setBrainStatus("LOCAL • Qwen2.5 7B พร้อมใช้งาน")
             replyAndStore(answer)
@@ -283,7 +285,7 @@ fun NeoScreen(
                         singleLine = true,
                         shape = RoundedCornerShape(16.dp)
                     )
-                    Text("คำถามที่มีคำว่า วันนี้ / ล่าสุด / ข่าว / ราคา / ค้นเว็บ จะค้นเว็บอัตโนมัติ", style = MaterialTheme.typography.bodySmall)
+                    Text("ข้อมูลเวลา/วันที่ใช้จากมือถือโดยตรง ส่วนข่าว ราคา ค่าเงิน จึงค่อยใช้ Web", style = MaterialTheme.typography.bodySmall)
                 }
             },
             confirmButton = {
@@ -342,12 +344,7 @@ fun NeoScreen(
                         Spacer(Modifier.height(18.dp))
                         Text("มีอะไรให้ NEO ช่วย?", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
                         Spacer(Modifier.height(8.dp))
-                        Text("Local 7B + ความจำ + Knowledge + ค้นเว็บเมื่อจำเป็น", style = MaterialTheme.typography.bodyMedium)
-                        Spacer(Modifier.height(20.dp))
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            SuggestionChip(onClick = { input = "ค้นเว็บข่าว AI ล่าสุด" }, label = { Text("ค้นเว็บ") })
-                            SuggestionChip(onClick = { input = "จำข้อมูลนี้ให้หน่อย" }, label = { Text("ความจำ") })
-                        }
+                        Text("Local 7B + ความจำ + Knowledge + Web เมื่อจำเป็น", style = MaterialTheme.typography.bodyMedium)
                     }
                 }
             } else {
@@ -396,7 +393,7 @@ fun NeoScreen(
                     }
                     Spacer(Modifier.height(6.dp))
                     Text(
-                        "NEO • ข้อมูลส่วนตัวและ Knowledge อยู่บนอุปกรณ์ • Web ใช้เมื่อจำเป็น",
+                        "NEO • ตอบสั้นก่อน • Web เฉพาะเมื่อจำเป็น",
                         modifier = Modifier.align(Alignment.CenterHorizontally),
                         style = MaterialTheme.typography.labelSmall
                     )
