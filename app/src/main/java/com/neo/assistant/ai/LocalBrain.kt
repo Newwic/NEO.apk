@@ -48,7 +48,7 @@ class LocalBrain(private val context: Context) {
             model = Llama.loadModel(
                 modelPath = file.absolutePath,
                 config = LlamaConfig(
-                    contextSize = 2048,
+                    contextSize = 1536,
                     threads = Runtime.getRuntime().availableProcessors().coerceIn(4, 6),
                     gpuLayers = 0,
                     temperature = 0.62f,
@@ -122,19 +122,34 @@ class LocalBrain(private val context: Context) {
         cfg: NeoLiveConfig,
         extraContext: List<String> = emptyList()
     ): String {
-        if (!prepare()) return "ยังติดตั้งสมอง Local 7B ไม่สำเร็จครับ ต้องมีพื้นที่ว่างอย่างน้อยประมาณ 6 GB และ RAM ว่างพอ"
+        val webBlocks = extraContext.filter { it.startsWith("[WEB ") }
+
+        // Critical fallback: live web answers must not get stuck behind slow 7B CPU inference.
+        // When the router already has fresh web results, return those immediately.
+        if (webBlocks.isNotEmpty()) {
+            return buildDirectWebAnswer(message, webBlocks)
+        }
+
+        if (!prepare()) {
+            if (extraContext.isNotEmpty()) {
+                return "ผมพบข้อมูลใน Knowledge แล้ว แต่สมอง Local 7B ยังไม่พร้อมครับ\n\n" +
+                    extraContext.take(4).joinToString("\n\n") { it.take(700) }
+            }
+            return "ยังติดตั้งสมอง Local 7B ไม่สำเร็จครับ ต้องมีพื้นที่ว่างอย่างน้อยประมาณ 6 GB และ RAM ว่างพอ"
+        }
 
         val memoryText = memories.joinToString("\n") {
             "[${it.category} | ${it.source}→${it.destination} | p${it.importance}] ${it.text}"
         }
-        val contextText = extraContext.take(10).joinToString("\n\n")
+        val contextText = extraContext.take(6).joinToString("\n\n")
         val system = buildString {
             append(cfg.systemPrompt)
             append("\nคุณชื่อ NEO เป็นผู้ช่วยส่วนตัวของผู้ใช้ ตอบภาษาไทยเป็นหลัก เว้นแต่ผู้ใช้ขอภาษาอื่น")
-            append("\nคุณทำงานบนมือถือแบบ Local และสามารถใช้ Memory, Local Knowledge และผลค้นเว็บที่ระบบส่งมาให้")
-            append("\nห้ามแต่งข้อมูลจากแหล่งข้อมูล หากข้อมูลไม่พอให้บอกตรง ๆ")
+            append("\nคุณทำงานบนมือถือแบบ Local และสามารถใช้ Memory กับ Local Knowledge")
+            append("\nตอบให้กระชับก่อน เพื่อลดเวลาประมวลผลบนมือถือ")
+            append("\nห้ามแต่งข้อมูล หากข้อมูลไม่พอให้บอกตรง ๆ")
             if (memoryText.isNotBlank()) append("\n\nMEMORY ROUTE DATA:\n$memoryText")
-            if (contextText.isNotBlank()) append("\n\nRAG / WEB CONTEXT:\n$contextText")
+            if (contextText.isNotBlank()) append("\n\nRAG CONTEXT:\n$contextText")
         }
 
         return try {
@@ -143,11 +158,42 @@ class LocalBrain(private val context: Context) {
                 model = current,
                 prompt = message,
                 systemPrompt = system,
-                maxTokens = cfg.maxTokens.coerceIn(64, 700)
+                maxTokens = cfg.maxTokens.coerceIn(64, 320)
             )
             result.text.trim().ifBlank { "ผมยังคิดคำตอบไม่ออกครับ ลองถามใหม่อีกครั้ง" }
         } catch (_: Exception) {
             "สมอง Local มีปัญหาระหว่างประมวลผลครับ ลองใหม่อีกครั้ง"
+        }
+    }
+
+    private fun buildDirectWebAnswer(message: String, webBlocks: List<String>): String {
+        val items = webBlocks.take(4).mapNotNull { block ->
+            val lines = block.lines().filter { it.isNotBlank() }
+            if (lines.isEmpty()) return@mapNotNull null
+            val title = lines.first().substringAfter(":", lines.first()).substringBeforeLast("]").trim()
+            val source = lines.firstOrNull { it.startsWith("SOURCE:") }
+                ?.removePrefix("SOURCE:")?.trim().orEmpty()
+            val snippet = lines
+                .filterNot { it.startsWith("[WEB ") || it.startsWith("SOURCE:") }
+                .joinToString(" ")
+                .replace(Regex("\\s+"), " ")
+                .trim()
+                .take(500)
+            Triple(title.ifBlank { "แหล่งข้อมูลเว็บ" }, snippet, source)
+        }
+
+        if (items.isEmpty()) return "ค้นเว็บได้แล้ว แต่ยังไม่พบข้อมูลที่ใช้ตอบได้ครับ"
+
+        return buildString {
+            append("ผมหาข้อมูลจากเว็บให้แล้วครับ")
+            if (message.isNotBlank()) append(" สำหรับคำถาม: “${message.take(120)}”")
+            append("\n\n")
+            items.forEachIndexed { index, (title, snippet, source) ->
+                append("${index + 1}. $title")
+                if (snippet.isNotBlank()) append("\n$snippet")
+                if (source.isNotBlank()) append("\n$source")
+                if (index != items.lastIndex) append("\n\n")
+            }
         }
     }
 
