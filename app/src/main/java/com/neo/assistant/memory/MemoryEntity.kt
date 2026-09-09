@@ -7,5 +7,12 @@ import androidx.room.PrimaryKey
 data class MemoryEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val text: String,
-    val createdAt: Long = System.currentTimeMillis()
+    val category: String = "general",
+    val source: String = "user",
+    val destination: String = "brain",
+    val keywords: String = "",
+    val importance: Int = 50,
+    val accessCount: Int = 0,
+    val createdAt: Long = System.currentTimeMillis(),
+    val updatedAt: Long = System.currentTimeMillis()
 )
