@@ -19,14 +19,20 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.lifecycleScope
 import com.neo.assistant.ai.LocalBrain
 import com.neo.assistant.config.NeoSettings
+import com.neo.assistant.data.AppDataDao
+import com.neo.assistant.data.ChatEntity
 import com.neo.assistant.dev.LiveConfigClient
 import com.neo.assistant.dev.NeoLiveConfig
+import com.neo.assistant.knowledge.KnowledgeHub
 import com.neo.assistant.memory.MemoryHub
 import com.neo.assistant.memory.NeoDatabase
 import com.neo.assistant.pc.PcWorkerClient
 import com.neo.assistant.tools.AppTools
 import com.neo.assistant.voice.NeoSpeechRecognizer
 import com.neo.assistant.voice.NeoTts
+import com.neo.assistant.web.WebSearchClient
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -37,6 +43,10 @@ class MainActivity : ComponentActivity() {
     private lateinit var brain: LocalBrain
     private lateinit var liveClient: LiveConfigClient
     private lateinit var memoryHub: MemoryHub
+    private lateinit var knowledgeHub: KnowledgeHub
+    private lateinit var appDataDao: AppDataDao
+    private val webSearch = WebSearchClient()
+
     @Volatile private var liveConfig = NeoLiveConfig()
     private var submitMessage: ((String) -> Unit)? = null
     private var updateStatus: ((String) -> Unit)? = null
@@ -48,13 +58,31 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private val knowledgeFileLauncher = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri == null) return@registerForActivityResult
+        lifecycleScope.launch {
+            try {
+                val text = contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }.orEmpty()
+                val title = uri.lastPathSegment?.substringAfterLast('/') ?: "Imported knowledge"
+                val chunks = knowledgeHub.importText(title, text, uri.toString())
+                submitMessage?.invoke("SYSTEM: นำเข้าความรู้สำเร็จ $chunks ส่วน • $title")
+            } catch (_: Exception) {
+                submitMessage?.invoke("SYSTEM: นำเข้าไฟล์ไม่สำเร็จ • รองรับ TXT/MD/JSON/CSV")
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         neoTts = NeoTts(this)
         settings = NeoSettings(this)
         brain = LocalBrain(this)
         liveClient = LiveConfigClient(settings.pcWorkerUrl)
-        memoryHub = MemoryHub(NeoDatabase.get(this).memoryDao())
+
+        val db = NeoDatabase.get(this)
+        memoryHub = MemoryHub(db.memoryDao())
+        appDataDao = db.appDataDao()
+        knowledgeHub = KnowledgeHub(appDataDao)
 
         lifecycleScope.launch {
             delay(500)
@@ -81,12 +109,23 @@ class MainActivity : ComponentActivity() {
                     onSend = ::onUserMessage,
                     onMic = { speechLauncher.launch(NeoSpeechRecognizer.intent()) },
                     onInstallBrain = { lifecycleScope.launch { brain.prepare(::setBrainStatus) } },
+                    onImportKnowledge = {
+                        knowledgeFileLauncher.launch(arrayOf("text/plain", "text/markdown", "application/json", "text/csv"))
+                    },
                     registerSubmitter = { submitMessage = it },
                     registerStatus = {
                         updateStatus = it
                         it(lastBrainStatus)
                     }
                 )
+            }
+        }
+
+        lifecycleScope.launch {
+            delay(350)
+            appDataDao.recentChats(80).asReversed().forEach { chat ->
+                val prefix = if (chat.role == "user") "คุณ:" else "NEO:"
+                submitMessage?.invoke("$prefix ${chat.text}")
             }
         }
     }
@@ -96,20 +135,28 @@ class MainActivity : ComponentActivity() {
         runOnUiThread { updateStatus?.invoke(text) }
     }
 
+    private fun shouldRemember(text: String): Boolean {
+        val t = text.lowercase()
+        return t.contains("จำ") || listOf(
+            "ผมชื่อ", "ฉันชื่อ", "ผมชอบ", "ผมไม่ชอบ", "เป้าหมายของผม", "งานของผม", "โปรเจกต์ของผม"
+        ).any { t.contains(it) }
+    }
+
     private fun onUserMessage(text: String) {
         submitMessage?.invoke("คุณ: $text")
         lifecycleScope.launch {
-            if (text.contains("จำ")) {
+            appDataDao.insertChat(ChatEntity(role = "user", text = text))
+
+            if (shouldRemember(text)) {
                 memoryHub.save(text, source = "user", destination = "brain")
             }
 
             Regex("เปิด\\s*(.+)").find(text)?.let { match ->
                 if (!text.contains("โปรเจกต์")) {
                     val target = match.groupValues[1].trim()
-                    reply(
-                        if (AppTools.openApp(this@MainActivity, target)) "เปิด $target ให้แล้วครับ"
-                        else "ผมหาแอป $target ไม่เจอครับ"
-                    )
+                    val answer = if (AppTools.openApp(this@MainActivity, target)) "เปิด $target ให้แล้วครับ"
+                    else "ผมหาแอป $target ไม่เจอครับ"
+                    replyAndStore(answer)
                     return@launch
                 }
             }
@@ -119,20 +166,57 @@ class MainActivity : ComponentActivity() {
             if (isCodingTask && settings.pcWorkerUrl.isNotBlank()) {
                 val pcResult = PcWorkerClient(settings.pcWorkerUrl).runTask(text)
                 if (!pcResult.contains("เชื่อม", ignoreCase = true) && !pcResult.contains("ไม่ได้", ignoreCase = true)) {
-                    reply(pcResult)
+                    replyAndStore(pcResult)
                     return@launch
                 }
             }
 
-            setBrainStatus("MEM • กำลังดึงข้อมูลหลายทางพร้อมกัน…")
-            val packet = memoryHub.retrieve(text)
-            submitMessage?.invoke("TRACE: ${packet.route} • ${packet.memories.size} รายการ • ${packet.elapsedMs} ms")
+            setBrainStatus("ROUTER • Memory + Knowledge กำลังค้นพร้อมกัน…")
+            val routed = coroutineScope {
+                val memory = async { memoryHub.retrieve(text) }
+                val knowledge = async { knowledgeHub.retrieve(text) }
+                val web = async {
+                    if (webSearch.shouldSearch(text)) webSearch.search(text)
+                    else WebSearchClient.Packet(emptyList(), 0)
+                }
+                Triple(memory.await(), knowledge.await(), web.await())
+            }
 
-            setBrainStatus("LOCAL • NEO 7B กำลังคิด…")
-            val answer = brain.generate(text, packet.memories, cfg)
+            val memoryPacket = routed.first
+            val knowledgePacket = routed.second
+            val webPacket = routed.third
+
+            val routeText = buildString {
+                append("${memoryPacket.memories.size} memory")
+                append(" + ${knowledgePacket.blocks.size} knowledge")
+                if (webPacket.results.isNotEmpty()) append(" + ${webPacket.results.size} web")
+                append(" → NEO 7B")
+            }
+            submitMessage?.invoke("TRACE: $routeText • ${memoryPacket.elapsedMs + knowledgePacket.elapsedMs + webPacket.elapsedMs} ms")
+
+            val extraContext = buildList {
+                addAll(knowledgePacket.blocks)
+                webPacket.results.forEachIndexed { index, r ->
+                    add("[WEB ${index + 1}: ${r.title}]\n${r.snippet}\nSOURCE: ${r.url}")
+                }
+            }
+
+            setBrainStatus(if (webPacket.results.isNotEmpty()) "WEB + RAG • NEO 7B กำลังคิด…" else "LOCAL RAG • NEO 7B กำลังคิด…")
+            var answer = brain.generate(text, memoryPacket.memories, cfg, extraContext)
+
+            if (webPacket.results.isNotEmpty()) {
+                val sources = webPacket.results.take(4).mapIndexed { i, it -> "${i + 1}. ${it.title} — ${it.url}" }
+                answer += "\n\nแหล่งข้อมูลเว็บ:\n" + sources.joinToString("\n")
+            }
+
             setBrainStatus("LOCAL • Qwen2.5 7B พร้อมใช้งาน")
-            reply(answer)
+            replyAndStore(answer)
         }
+    }
+
+    private suspend fun replyAndStore(text: String) {
+        appDataDao.insertChat(ChatEntity(role = "assistant", text = text))
+        reply(text)
     }
 
     private fun reply(text: String) {
@@ -155,6 +239,7 @@ fun NeoScreen(
     onSend: (String) -> Unit,
     onMic: () -> Unit,
     onInstallBrain: () -> Unit,
+    onImportKnowledge: () -> Unit,
     registerSubmitter: (((String) -> Unit) -> Unit),
     registerStatus: (((String) -> Unit) -> Unit)
 ) {
@@ -175,30 +260,30 @@ fun NeoScreen(
             shape = RoundedCornerShape(28.dp),
             title = { Text("ตั้งค่า NEO", fontWeight = FontWeight.SemiBold) },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                    Surface(
-                        shape = RoundedCornerShape(18.dp),
-                        color = MaterialTheme.colorScheme.surfaceVariant
-                    ) {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Surface(shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.surfaceVariant) {
                         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                            Text("สมอง Local", fontWeight = FontWeight.SemiBold)
-                            Text("Qwen2.5 7B Q4 • llama.cpp • ทำงานบนมือถือ", style = MaterialTheme.typography.bodySmall)
-                            Text("Memory Hub: recent + category + source → brain แบบขนาน", style = MaterialTheme.typography.bodySmall)
+                            Text("NEO Local Stack", fontWeight = FontWeight.SemiBold)
+                            Text("Qwen2.5 7B Q4 + Memory Hub + Local Knowledge RAG + Web Router", style = MaterialTheme.typography.bodySmall)
+                            Text("Chat history และ Knowledge เก็บใน neo.db บนมือถือ", style = MaterialTheme.typography.bodySmall)
                         }
                     }
                     Button(onClick = onInstallBrain, modifier = Modifier.fillMaxWidth()) {
                         Text("ติดตั้ง / โหลดสมอง Local 7B")
+                    }
+                    OutlinedButton(onClick = onImportKnowledge, modifier = Modifier.fillMaxWidth()) {
+                        Text("＋ นำเข้าความรู้ TXT / MD / JSON / CSV")
                     }
                     OutlinedTextField(
                         value = pcUrl,
                         onValueChange = { pcUrl = it },
                         modifier = Modifier.fillMaxWidth(),
                         label = { Text("PC Worker URL") },
-                        supportingText = { Text("ไม่จำเป็นสำหรับการแชต Local") },
+                        supportingText = { Text("ไม่จำเป็นสำหรับ Local Chat / RAG") },
                         singleLine = true,
                         shape = RoundedCornerShape(16.dp)
                     )
-                    Text("7B ใช้พื้นที่หลาย GB และ RAM มากกว่า 3B แต่ตอบและเขียนโค้ดได้ดีขึ้น", style = MaterialTheme.typography.bodySmall)
+                    Text("คำถามที่มีคำว่า วันนี้ / ล่าสุด / ข่าว / ราคา / ค้นเว็บ จะค้นเว็บอัตโนมัติ", style = MaterialTheme.typography.bodySmall)
                 }
             },
             confirmButton = {
@@ -217,11 +302,7 @@ fun NeoScreen(
             TopAppBar(
                 title = {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Surface(
-                            modifier = Modifier.size(38.dp),
-                            shape = CircleShape,
-                            color = MaterialTheme.colorScheme.primary
-                        ) {
+                        Surface(modifier = Modifier.size(38.dp), shape = CircleShape, color = MaterialTheme.colorScheme.primary) {
                             Box(contentAlignment = Alignment.Center) {
                                 Text("N", color = MaterialTheme.colorScheme.onPrimary, fontWeight = FontWeight.Bold)
                             }
@@ -229,7 +310,7 @@ fun NeoScreen(
                         Spacer(Modifier.width(10.dp))
                         Column {
                             Text("NEO", fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.titleMedium)
-                            Text("Local 7B • Routed Memory", style = MaterialTheme.typography.labelSmall)
+                            Text("7B • Memory • RAG • Web", style = MaterialTheme.typography.labelSmall)
                         }
                     }
                 },
@@ -237,21 +318,13 @@ fun NeoScreen(
             )
         }
     ) { padding ->
-        Column(
-            modifier = Modifier
-                .padding(padding)
-                .fillMaxSize()
-                .imePadding()
-        ) {
+        Column(modifier = Modifier.padding(padding).fillMaxSize().imePadding()) {
             Surface(
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
                 shape = RoundedCornerShape(50),
                 color = MaterialTheme.colorScheme.surfaceVariant
             ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
+                Row(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text("●", style = MaterialTheme.typography.labelSmall)
                     Spacer(Modifier.width(7.dp))
                     Text(status, style = MaterialTheme.typography.labelMedium)
@@ -259,16 +332,9 @@ fun NeoScreen(
             }
 
             if (messages.isEmpty()) {
-                Box(
-                    modifier = Modifier.weight(1f).fillMaxWidth().padding(24.dp),
-                    contentAlignment = Alignment.Center
-                ) {
+                Box(modifier = Modifier.weight(1f).fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Surface(
-                            modifier = Modifier.size(72.dp),
-                            shape = CircleShape,
-                            color = MaterialTheme.colorScheme.primary
-                        ) {
+                        Surface(modifier = Modifier.size(72.dp), shape = CircleShape, color = MaterialTheme.colorScheme.primary) {
                             Box(contentAlignment = Alignment.Center) {
                                 Text("N", color = MaterialTheme.colorScheme.onPrimary, style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
                             }
@@ -276,10 +342,10 @@ fun NeoScreen(
                         Spacer(Modifier.height(18.dp))
                         Text("มีอะไรให้ NEO ช่วย?", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
                         Spacer(Modifier.height(8.dp))
-                        Text("7B Local AI + Memory Hub ที่ดึงข้อมูลหลายต้นทางพร้อมกัน", style = MaterialTheme.typography.bodyMedium)
+                        Text("Local 7B + ความจำ + Knowledge + ค้นเว็บเมื่อจำเป็น", style = MaterialTheme.typography.bodyMedium)
                         Spacer(Modifier.height(20.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            SuggestionChip(onClick = { input = "นายทำอะไรได้บ้าง" }, label = { Text("ทำอะไรได้บ้าง") })
+                            SuggestionChip(onClick = { input = "ค้นเว็บข่าว AI ล่าสุด" }, label = { Text("ค้นเว็บ") })
                             SuggestionChip(onClick = { input = "จำข้อมูลนี้ให้หน่อย" }, label = { Text("ความจำ") })
                         }
                     }
@@ -330,7 +396,7 @@ fun NeoScreen(
                     }
                     Spacer(Modifier.height(6.dp))
                     Text(
-                        "NEO • Local 7B • ข้อมูลและความจำอยู่บนอุปกรณ์ของคุณ",
+                        "NEO • ข้อมูลส่วนตัวและ Knowledge อยู่บนอุปกรณ์ • Web ใช้เมื่อจำเป็น",
                         modifier = Modifier.align(Alignment.CenterHorizontally),
                         style = MaterialTheme.typography.labelSmall
                     )
@@ -343,30 +409,23 @@ fun NeoScreen(
 @Composable
 private fun NeoMessage(raw: String) {
     if (raw.startsWith("TRACE:")) {
-        Surface(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(14.dp),
-            color = MaterialTheme.colorScheme.surfaceVariant
-        ) {
-            Text(
-                "↔ ${raw.removePrefix("TRACE:").trim()}",
-                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                style = MaterialTheme.typography.labelMedium
-            )
+        Surface(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(14.dp), color = MaterialTheme.colorScheme.surfaceVariant) {
+            Text("↔ ${raw.removePrefix("TRACE:").trim()}", Modifier.padding(horizontal = 12.dp, vertical = 8.dp), style = MaterialTheme.typography.labelMedium)
+        }
+        return
+    }
+    if (raw.startsWith("SYSTEM:")) {
+        Surface(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(14.dp), color = MaterialTheme.colorScheme.secondaryContainer) {
+            Text(raw.removePrefix("SYSTEM:").trim(), Modifier.padding(horizontal = 12.dp, vertical = 8.dp), style = MaterialTheme.typography.bodySmall)
         }
         return
     }
 
     val isUser = raw.startsWith("คุณ:")
     val text = raw.substringAfter(":", raw).trim()
-
     if (isUser) {
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-            Surface(
-                modifier = Modifier.widthIn(max = 310.dp),
-                shape = RoundedCornerShape(22.dp),
-                color = MaterialTheme.colorScheme.primaryContainer
-            ) {
+            Surface(modifier = Modifier.widthIn(max = 310.dp), shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.primaryContainer) {
                 Text(text, Modifier.padding(horizontal = 16.dp, vertical = 12.dp))
             }
         }
