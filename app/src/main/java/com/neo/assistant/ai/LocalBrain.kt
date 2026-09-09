@@ -14,13 +14,16 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
 import java.io.FileOutputStream
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 
 class LocalBrain(private val context: Context) {
     companion object {
         private const val MODEL_FILE = "Qwen2.5-7B-Instruct-Q4_K_M.gguf"
         private const val MODEL_URL = "https://huggingface.co/lmstudio-community/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_K_M.gguf?download=true"
         private const val MIN_MODEL_BYTES = 4_000_000_000L
+        private const val INFERENCE_TIMEOUT_SECONDS = 75L
     }
 
     private val mutex = Mutex()
@@ -28,7 +31,10 @@ class LocalBrain(private val context: Context) {
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.SECONDS)
         .build()
-    private var model: LlamaModel? = null
+    private val inferenceExecutor = Executors.newSingleThreadExecutor()
+
+    @Volatile private var model: LlamaModel? = null
+    @Volatile private var inferenceTimedOut = false
 
     fun modelFile(): File {
         val dir = context.getExternalFilesDir("models") ?: File(context.filesDir, "models")
@@ -44,22 +50,25 @@ class LocalBrain(private val context: Context) {
             if (!ok) return@withLock false
         }
         return@withLock try {
-            onStatus("LOCAL • กำลังโหลดสมอง 7B…")
+            val gb = file.length().toDouble() / 1_073_741_824.0
+            onStatus("LOCAL • พบโมเดล 7B %.1f GB • กำลังโหลด…".format(gb))
             model = Llama.loadModel(
                 modelPath = file.absolutePath,
                 config = LlamaConfig(
-                    contextSize = 1536,
-                    threads = Runtime.getRuntime().availableProcessors().coerceIn(4, 6),
+                    // Smaller context/token budget for phone CPU/RAM stability.
+                    contextSize = 1024,
+                    threads = Runtime.getRuntime().availableProcessors().coerceIn(4, 5),
                     gpuLayers = 0,
                     temperature = 0.62f,
                     topP = 0.9f,
                     topK = 40
                 )
             )
+            inferenceTimedOut = false
             onStatus("LOCAL • Qwen2.5 7B พร้อมใช้งาน")
             true
-        } catch (_: Exception) {
-            onStatus("LOCAL • โหลด 7B ไม่สำเร็จ • เช็ก RAM/พื้นที่")
+        } catch (e: Throwable) {
+            onStatus("LOCAL • โหลด 7B ไม่สำเร็จ • ${e.javaClass.simpleName}")
             false
         }
     }
@@ -110,8 +119,8 @@ class LocalBrain(private val context: Context) {
                 tmp.delete()
             }
             true
-        } catch (_: Exception) {
-            onStatus("LOCAL • ดาวน์โหลดสมอง 7B ขัดข้อง")
+        } catch (e: Throwable) {
+            onStatus("LOCAL • ดาวน์โหลด 7B ขัดข้อง • ${e.javaClass.simpleName}")
             false
         }
     }
@@ -120,49 +129,64 @@ class LocalBrain(private val context: Context) {
         message: String,
         memories: List<MemoryEntity>,
         cfg: NeoLiveConfig,
-        extraContext: List<String> = emptyList()
-    ): String {
+        extraContext: List<String> = emptyList(),
+        onStatus: (String) -> Unit = {}
+    ): String = withContext(Dispatchers.IO) {
         val webBlocks = extraContext.filter { it.startsWith("[WEB ") }
+        if (webBlocks.isNotEmpty()) return@withContext buildDirectWebAnswer(message, webBlocks)
 
-        // Critical fallback: live web answers must not get stuck behind slow 7B CPU inference.
-        // When the router already has fresh web results, return those immediately.
-        if (webBlocks.isNotEmpty()) {
-            return buildDirectWebAnswer(message, webBlocks)
+        if (inferenceTimedOut) {
+            return@withContext "สมอง 7B เคยค้างในรอบนี้ครับ กรุณาปิด NEO แล้วเปิดใหม่ หรือใช้ Web/Knowledge ก่อน ระหว่างที่ปรับโหมด 7B ให้เหมาะกับเครื่อง"
         }
 
-        if (!prepare()) {
+        if (!prepare(onStatus)) {
             if (extraContext.isNotEmpty()) {
-                return "ผมพบข้อมูลใน Knowledge แล้ว แต่สมอง Local 7B ยังไม่พร้อมครับ\n\n" +
+                return@withContext "ผมพบข้อมูลใน Knowledge แล้ว แต่สมอง Local 7B ยังไม่พร้อมครับ\n\n" +
                     extraContext.take(4).joinToString("\n\n") { it.take(700) }
             }
-            return "ยังติดตั้งสมอง Local 7B ไม่สำเร็จครับ ต้องมีพื้นที่ว่างอย่างน้อยประมาณ 6 GB และ RAM ว่างพอ"
+            return@withContext "ยังติดตั้งสมอง Local 7B ไม่สำเร็จครับ ต้องมีพื้นที่ว่างอย่างน้อยประมาณ 6 GB และ RAM ว่างพอ"
         }
 
-        val memoryText = memories.joinToString("\n") {
-            "[${it.category} | ${it.source}→${it.destination} | p${it.importance}] ${it.text}"
+        val memoryText = memories.take(8).joinToString("\n") {
+            "[${it.category} | ${it.source}→${it.destination} | p${it.importance}] ${it.text.take(350)}"
         }
-        val contextText = extraContext.take(6).joinToString("\n\n")
+        val contextText = extraContext.take(4).joinToString("\n\n") { it.take(600) }
         val system = buildString {
             append(cfg.systemPrompt)
             append("\nคุณชื่อ NEO เป็นผู้ช่วยส่วนตัวของผู้ใช้ ตอบภาษาไทยเป็นหลัก เว้นแต่ผู้ใช้ขอภาษาอื่น")
             append("\nคุณทำงานบนมือถือแบบ Local และสามารถใช้ Memory กับ Local Knowledge")
-            append("\nตอบให้กระชับก่อน เพื่อลดเวลาประมวลผลบนมือถือ")
+            append("\nตอบสั้น กระชับ และตรงคำถาม เพื่อลดเวลาประมวลผลบนมือถือ")
             append("\nห้ามแต่งข้อมูล หากข้อมูลไม่พอให้บอกตรง ๆ")
             if (memoryText.isNotBlank()) append("\n\nMEMORY ROUTE DATA:\n$memoryText")
             if (contextText.isNotBlank()) append("\n\nRAG CONTEXT:\n$contextText")
         }
 
-        return try {
-            val current = model ?: return "สมอง Local ยังไม่พร้อมครับ"
+        val current = model ?: return@withContext "สมอง Local ยังไม่พร้อมครับ"
+        onStatus("LOCAL • 7B กำลังสร้างคำตอบ • จำกัด ${INFERENCE_TIMEOUT_SECONDS}s")
+
+        val future = inferenceExecutor.submit<String> {
             val result = Llama.complete(
                 model = current,
-                prompt = message,
-                systemPrompt = system,
-                maxTokens = cfg.maxTokens.coerceIn(64, 320)
+                prompt = message.take(1200),
+                systemPrompt = system.take(7000),
+                maxTokens = cfg.maxTokens.coerceIn(48, 128)
             )
             result.text.trim().ifBlank { "ผมยังคิดคำตอบไม่ออกครับ ลองถามใหม่อีกครั้ง" }
-        } catch (_: Exception) {
-            "สมอง Local มีปัญหาระหว่างประมวลผลครับ ลองใหม่อีกครั้ง"
+        }
+
+        try {
+            val answer = future.get(INFERENCE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            onStatus("LOCAL • Qwen2.5 7B พร้อมใช้งาน")
+            answer
+        } catch (_: TimeoutException) {
+            inferenceTimedOut = true
+            future.cancel(true)
+            onStatus("LOCAL • 7B ใช้เวลานานเกิน 75s • หยุดรอแล้ว")
+            "สมอง 7B ใช้เวลานานเกิน 75 วินาทีบนเครื่องนี้ ผมหยุดรอเพื่อไม่ให้แอปค้างครับ ข้อมูล Memory/RAG ยังทำงานปกติ — รอบถัดไปควรใช้โหมด 3B/7B Auto"
+        } catch (e: Throwable) {
+            future.cancel(true)
+            onStatus("LOCAL • 7B error • ${e.javaClass.simpleName}")
+            "สมอง Local 7B มีปัญหาระหว่างประมวลผล (${e.javaClass.simpleName}) ครับ"
         }
     }
 
@@ -198,7 +222,10 @@ class LocalBrain(private val context: Context) {
     }
 
     fun release() {
-        model?.let { Llama.releaseModel(it) }
+        inferenceExecutor.shutdownNow()
+        if (!inferenceTimedOut) {
+            model?.let { runCatching { Llama.releaseModel(it) } }
+        }
         model = null
     }
 }
