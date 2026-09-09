@@ -68,8 +68,10 @@ class MainActivity : ComponentActivity() {
                     initialBrainUrl = settings.brainUrl,
                     initialPcUrl = settings.pcWorkerUrl,
                     onSaveSettings = { brainUrl, pcUrl ->
-                        settings.brainUrl = brainUrl; settings.pcWorkerUrl = pcUrl
-                        brain.setBaseUrl(brainUrl); liveClient.setWorkerUrl(pcUrl)
+                        settings.brainUrl = brainUrl
+                        settings.pcWorkerUrl = pcUrl
+                        brain.setBaseUrl(brainUrl)
+                        liveClient.setWorkerUrl(pcUrl)
                     },
                     onSend = ::onUserMessage,
                     onMic = { speechLauncher.launch(NeoSpeechRecognizer.intent()) },
@@ -89,7 +91,10 @@ class MainActivity : ComponentActivity() {
             Regex("เปิด\\s*(.+)").find(text)?.let { match ->
                 if (!text.contains("โปรเจกต์")) {
                     val target = match.groupValues[1].trim()
-                    reply(if (AppTools.openApp(this@MainActivity, target)) "เปิด $target ให้แล้วครับ" else "ผมหาแอป $target ไม่เจอครับ")
+                    reply(
+                        if (AppTools.openApp(this@MainActivity, target)) "เปิด $target ให้แล้วครับ"
+                        else "ผมหาแอป $target ไม่เจอครับ"
+                    )
                     return@launch
                 }
             }
@@ -104,44 +109,117 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun reply(text: String) { submitMessage?.invoke("${liveConfig.assistantName}: $text"); neoTts.speak(text) }
-    override fun onDestroy() { neoTts.shutdown(); super.onDestroy() }
+    private fun reply(text: String) {
+        submitMessage?.invoke("${liveConfig.assistantName}: $text")
+        neoTts.speak(text)
+    }
+
+    override fun onDestroy() {
+        neoTts.shutdown()
+        super.onDestroy()
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun NeoScreen(
-    initialBrainUrl: String, initialPcUrl: String,
-    onSaveSettings: (String, String) -> Unit, onSend: (String) -> Unit, onMic: () -> Unit,
-    registerSubmitter: (((String) -> Unit) -> Unit), registerStatus: (((String) -> Unit) -> Unit)
+    initialBrainUrl: String,
+    initialPcUrl: String,
+    onSaveSettings: (String, String) -> Unit,
+    onSend: (String) -> Unit,
+    onMic: () -> Unit,
+    registerSubmitter: (((String) -> Unit) -> Unit),
+    registerStatus: (((String) -> Unit) -> Unit)
 ) {
     val messages = remember { mutableStateListOf("NEO: พร้อมใช้งาน • Local First") }
-    var input by remember { mutableStateOf("") }; var showSettings by remember { mutableStateOf(false) }
-    var brainUrl by remember { mutableStateOf(initialBrainUrl) }; var pcUrl by remember { mutableStateOf(initialPcUrl) }
+    var input by remember { mutableStateOf("") }
+    var showSettings by remember { mutableStateOf(false) }
+    var brainUrl by remember { mutableStateOf(initialBrainUrl) }
+    var pcUrl by remember { mutableStateOf(initialPcUrl) }
     var status by remember { mutableStateOf("LOCAL • waiting config") }
-    LaunchedEffect(Unit) { registerSubmitter { messages.add(it) }; registerStatus { status = it } }
 
-    if (showSettings) AlertDialog(
-        onDismissRequest = { showSettings = false }, title = { Text("NEO Local Settings") },
-        text = { Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Text("llama.cpp บนมือถือ"); OutlinedTextField(brainUrl, { brainUrl = it }, label = { Text("Brain URL") })
-            Text("PC Worker / Live Reload"); OutlinedTextField(pcUrl, { pcUrl = it }, label = { Text("PC Worker URL") })
-            Text("แก้ config/neo-config.json บน PC แล้วมือถือจะอัปเดตเอง")
-        } },
-        confirmButton = { Button(onClick = { onSaveSettings(brainUrl, pcUrl); showSettings = false }) { Text("บันทึก") } },
-        dismissButton = { TextButton(onClick = { showSettings = false }) { Text("ยกเลิก") } }
-    )
+    LaunchedEffect(Unit) {
+        registerSubmitter { messages.add(it) }
+        registerStatus { status = it }
+    }
 
-    Scaffold(topBar = { TopAppBar(title = { Column { Text("NEO • Local Assistant"); Text(status, style = MaterialTheme.typography.labelSmall) } }, actions = { IconButton(onClick = { showSettings = true }) { Text("⚙") } }) }) { padding ->
+    if (showSettings) {
+        AlertDialog(
+            onDismissRequest = { showSettings = false },
+            title = { Text("NEO Local Settings") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("llama.cpp บนมือถือ")
+                    OutlinedTextField(brainUrl, { brainUrl = it }, label = { Text("Brain URL") })
+                    Text("PC Worker / Live Reload")
+                    OutlinedTextField(pcUrl, { pcUrl = it }, label = { Text("PC Worker URL") })
+                    Text("แก้ config/neo-config.json บน PC แล้วมือถือจะอัปเดตเอง")
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    onSaveSettings(brainUrl, pcUrl)
+                    showSettings = false
+                }) { Text("บันทึก") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showSettings = false }) { Text("ยกเลิก") }
+            }
+        )
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = {
+                    Column {
+                        Text("NEO • Local Assistant")
+                        Text(status, style = MaterialTheme.typography.labelSmall)
+                    }
+                },
+                actions = {
+                    IconButton(onClick = { showSettings = true }) { Text("⚙") }
+                }
+            )
+        }
+    ) { padding ->
         Column(Modifier.padding(padding).fillMaxSize().padding(16.dp)) {
-            LazyColumn(Modifier.weight(1f).fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                items(messages) { Card(Modifier.fillMaxWidth()) { Text(it, Modifier.padding(12.dp)) } }
+            LazyColumn(
+                modifier = Modifier.weight(1f).fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                items(messages) {
+                    Card(Modifier.fillMaxWidth()) {
+                        Text(it, Modifier.padding(12.dp))
+                    }
+                }
             }
-            Spacer(Modifier.height(10.dp)); Row(verticalAlignment = Alignment.CenterVertically) {
-                OutlinedTextField(input, { input = it }, Modifier.weight(1f), placeholder = { Text("พิมพ์หา NEO...") })
-                Spacer(Modifier.width(8.dp)); Button(onClick = onMic) { Text("🎙") }
+
+            Spacer(Modifier.height(10.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                OutlinedTextField(
+                    value = input,
+                    onValueChange = { input = it },
+                    modifier = Modifier.weight(1f),
+                    placeholder = { Text("พิมพ์หา NEO...") }
+                )
+                Spacer(Modifier.width(8.dp))
+                Button(onClick = onMic) { Text("🎙") }
             }
-            Spacer(Modifier.height(8.dp)); Button(Modifier.fillMaxWidth(), onClick = { if (input.isNotBlank()) { val t = input; input = ""; onSend(t) } }) { Text("ส่ง") }
+
+            Spacer(Modifier.height(8.dp))
+            Button(
+                onClick = {
+                    if (input.isNotBlank()) {
+                        val t = input
+                        input = ""
+                        onSend(t)
+                    }
+                },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("ส่ง")
+            }
         }
     }
 }
