@@ -35,10 +35,11 @@ class KnowledgeHub(private val dao: AppDataDao) {
     suspend fun retrieve(query: String, limit: Int = 8): Packet {
         val started = System.currentTimeMillis()
         val q = tokenize(query)
-        // Scan a much larger local pool so the store can keep growing for a long time.
         val ranked = dao.knowledge(3000)
             .map { item -> item to score(item, q) }
-            .filter { it.second > 0 }
+            // A single weak body-word match used to inject unrelated learned-web text.
+            // Require either a title hit or multiple meaningful body hits.
+            .filter { it.second >= MIN_RELEVANCE_SCORE }
             .sortedByDescending { it.second }
             .take(limit)
             .map { it.first }
@@ -46,19 +47,24 @@ class KnowledgeHub(private val dao: AppDataDao) {
         return Packet(
             blocks = ranked.map { "[KNOWLEDGE: ${it.title} | ${it.source}]\n${it.content}" },
             sources = ranked.map { if (it.sourceUri.isBlank()) it.title else "${it.title} • ${it.sourceUri}" },
-            route = "multilingual-local-knowledge → rag → brain",
+            route = "relevance-gated knowledge → rag → brain",
             elapsedMs = System.currentTimeMillis() - started
         )
     }
 
-    private fun score(item: KnowledgeEntity, query: Set<String>): Int {
+    internal fun score(item: KnowledgeEntity, query: Set<String>): Int {
         if (query.isEmpty()) return 0
         val title = tokenize(item.title)
         val body = tokenize(item.content + " " + item.keywords)
-        var score = query.intersect(title).size * 35 + query.intersect(body).size * 10
-        if (item.source == "learned-web") score += 3
+        val titleHits = query.intersect(title).size
+        val bodyHits = query.intersect(body).size
+        var score = titleHits * 35 + bodyHits * 10
+        // Learned web is useful, but should never become relevant solely because it came from web.
+        if (item.source == "learned-web" && (titleHits > 0 || bodyHits >= 2)) score += 3
         return score
     }
+
+    internal fun tokenizeForTest(text: String): Set<String> = tokenize(text)
 
     private fun chunk(text: String, max: Int): List<String> {
         if (text.length <= max) return listOf(text)
@@ -78,7 +84,7 @@ class KnowledgeHub(private val dao: AppDataDao) {
         return out.filter { it.isNotBlank() }
     }
 
-    /** Unicode tokenizer: Thai/English/CJK/Korean/European scripts are all retained. */
+    /** Unicode tokenizer: Thai/English/CJK/Korean/European scripts are retained. */
     private fun tokenize(text: String): Set<String> = text
         .lowercase()
         .replace(Regex("[^\\p{L}\\p{N}_]+"), " ")
@@ -86,4 +92,8 @@ class KnowledgeHub(private val dao: AppDataDao) {
         .map { it.trim() }
         .filter { it.isNotEmpty() }
         .toSet()
+
+    companion object {
+        internal const val MIN_RELEVANCE_SCORE = 20
+    }
 }
