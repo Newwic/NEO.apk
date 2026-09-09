@@ -15,16 +15,16 @@ class WebSearchClient {
     data class Result(val title: String, val snippet: String, val url: String)
     data class Packet(val results: List<Result>, val elapsedMs: Long)
 
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(8, TimeUnit.SECONDS)
-        .readTimeout(12, TimeUnit.SECONDS)
-        .build()
+    private val client = OkHttpClient.Builder().connectTimeout(8, TimeUnit.SECONDS).readTimeout(12, TimeUnit.SECONDS).build()
 
     fun shouldSearch(query: String): Boolean {
         val t = query.lowercase().trim()
-        val localOnly = listOf("กี่โมง", "ตอนนี้เวลา", "เวลาตอนนี้", "วันนี้วันอะไร", "พรุ่งนี้วันอะไร", "วันที่เท่าไหร่")
+        val localOnly = listOf(
+            "กี่โมง", "ตอนนี้เวลา", "เวลาตอนนี้", "วันนี้วันอะไร", "พรุ่งนี้วันอะไร", "เมื่อวานวันอะไร", "วันที่เท่าไหร่",
+            "นายเป็นใคร", "คุณเป็นใคร", "นายชื่อ", "คุณชื่อ", "อายุเท่า", "นายชอบอะไร", "คุณชอบอะไร",
+            "นายเก่งอะไร", "ทำอะไรได้บ้าง", "ช่วยอะไรได้บ้าง", "ทำไรอยู่", "ทำอะไรอยู่"
+        )
         if (localOnly.any { t.contains(it) }) return false
-
         val dynamic = listOf(
             "ค้นเว็บ", "ค้นหาเว็บ", "search web", "ล่าสุด", "ข่าว", "ราคา", "current", "latest", "today",
             "news", "update", "อัปเดต", "สด", "อัตราแลกเปลี่ยน", "ค่าเงิน", "แลกเงิน", "exchange rate", "fx",
@@ -38,8 +38,9 @@ class WebSearchClient {
         val t = query.lowercase().trim()
         if (t.length < 2) return false
         val neverWeb = listOf(
-            "กี่โมง", "ตอนนี้เวลา", "เวลาตอนนี้", "วันนี้วันอะไร", "พรุ่งนี้วันอะไร", "วันที่เท่าไหร่",
-            "นายเป็นใคร", "คุณเป็นใคร", "นายชื่ออะไร", "ชื่ออะไร", "นายเก่งอะไร", "ทำอะไรได้บ้าง",
+            "กี่โมง", "ตอนนี้เวลา", "เวลาตอนนี้", "วันนี้วันอะไร", "พรุ่งนี้วันอะไร", "เมื่อวานวันอะไร", "วันที่เท่าไหร่",
+            "นายเป็นใคร", "คุณเป็นใคร", "นายชื่อ", "คุณชื่อ", "ชื่ออะไร", "อายุเท่า", "นายชอบอะไร", "คุณชอบอะไร",
+            "นายเก่งอะไร", "ทำอะไรได้บ้าง", "ช่วยอะไรได้บ้าง", "ทำไรอยู่", "ทำอะไรอยู่",
             "จำอะไร", "ผมชื่อ", "ฉันชื่อ", "ผมชอบ", "ข้อมูลของผม", "เปิดแอป"
         )
         return neverWeb.none { t.contains(it) }
@@ -50,16 +51,13 @@ class WebSearchClient {
         val t = query.lowercase()
         val isNews = listOf("ข่าว", "news", "ล่าสุด", "update", "อัปเดต").any { t.contains(it) }
         val isCurrency = listOf("dollar", "ดอลลาร์", "usd", "euro", "ยูโร", "eur", "yen", "เยน", "jpy", "pound", "ปอนด์", "gbp", "บาท", "thb", "ค่าเงิน", "อัตราแลกเปลี่ยน").any { t.contains(it) }
-
         val currency = async { if (isCurrency) searchCurrency(query) else emptyList() }
         val news = async { if (isNews) searchGoogleNews(query) else emptyList() }
         val ddg = async { if (!isCurrency && !isNews) searchDuckDuckGo(query) else emptyList() }
         val wiki = async { if (!isNews && !isCurrency) searchThaiWikipedia(query) else emptyList() }
-
         val merged = (currency.await() + news.await() + ddg.await() + wiki.await())
             .filter { it.title.isNotBlank() && it.snippet.isNotBlank() }
-            .distinctBy { it.title.lowercase() }
-            .take(5)
+            .distinctBy { it.title.lowercase() }.take(5)
         Packet(merged, System.currentTimeMillis() - started)
     }
 
@@ -141,7 +139,14 @@ class WebSearchClient {
             client.newCall(req).execute().use { res ->
                 if (!res.isSuccessful) return@withContext emptyList()
                 val arr = JSONObject(res.body?.string().orEmpty()).optJSONObject("query")?.optJSONArray("search") ?: return@withContext emptyList()
-                buildList { for (i in 0 until arr.length()) { val o=arr.optJSONObject(i)?:continue; val title=o.optString("title"); val snippet=o.optString("snippet").replace(Regex("<[^>]+>")," ").replace(Regex("\\s+")," ").trim(); add(Result(title,snippet,"https://th.wikipedia.org/wiki/${URLEncoder.encode(title.replace(' ','_'),"UTF-8")}")) } }
+                buildList {
+                    for (i in 0 until arr.length()) {
+                        val o = arr.optJSONObject(i) ?: continue
+                        val title = o.optString("title")
+                        val snippet = o.optString("snippet").replace(Regex("<[^>]+>"), " ").replace(Regex("\\s+"), " ").trim()
+                        add(Result(title, snippet, "https://th.wikipedia.org/wiki/${URLEncoder.encode(title.replace(' ', '_'), "UTF-8")}"))
+                    }
+                }
             }
         } catch (_: Exception) { emptyList() }
     }
