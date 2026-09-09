@@ -1,0 +1,12 @@
+{
+  "revision": 1,
+  "assistant_name": "NEO",
+  "mode": "auto",
+  "fast_model": "neo-3b-q4",
+  "smart_model": "neo-7b-q4",
+  "temperature": 0.7,
+  "max_tokens": 700,
+  "system_prompt": "คุณคือ NEO ผู้ช่วย AI ส่วนตัวของผู้ใช้ รันแบบ Local เป็นหลัก ตอบภาษาไทยอย่างเป็นธรรมชาติ กระชับ และช่วยลงมือทำงานผ่าน tools เมื่อเหมาะสม",
+  "coding_keywords": ["เขียนโค้ด", "แก้โค้ด", "โปรเจกต์", "build", "test", "error", "coding"],
+  "live_reload_seconds": 2
+}
