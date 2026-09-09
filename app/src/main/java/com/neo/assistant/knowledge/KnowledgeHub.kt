@@ -11,7 +11,7 @@ class KnowledgeHub(private val dao: AppDataDao) {
         val elapsedMs: Long
     )
 
-    suspend fun importText(title: String, text: String, sourceUri: String = ""): Int {
+    suspend fun importText(title: String, text: String, sourceUri: String = "", source: String = "local-file"): Int {
         val clean = text.trim()
         if (clean.isBlank()) return 0
         val chunks = chunk(clean, 1800)
@@ -20,19 +20,23 @@ class KnowledgeHub(private val dao: AppDataDao) {
                 KnowledgeEntity(
                     title = if (chunks.size == 1) title else "$title • ${index + 1}/${chunks.size}",
                     content = part,
-                    source = "local-file",
+                    source = source,
                     sourceUri = sourceUri,
-                    keywords = tokenize(title + " " + part).take(80).joinToString(" ")
+                    keywords = tokenize(title + " " + part).take(140).joinToString(" ")
                 )
             )
         }
         return chunks.size
     }
 
-    suspend fun retrieve(query: String, limit: Int = 6): Packet {
+    suspend fun learnWeb(title: String, text: String, url: String): Int =
+        importText(title = title, text = text, sourceUri = url, source = "learned-web")
+
+    suspend fun retrieve(query: String, limit: Int = 8): Packet {
         val started = System.currentTimeMillis()
         val q = tokenize(query)
-        val ranked = dao.knowledge(300)
+        // Scan a much larger local pool so the store can keep growing for a long time.
+        val ranked = dao.knowledge(3000)
             .map { item -> item to score(item, q) }
             .filter { it.second > 0 }
             .sortedByDescending { it.second }
@@ -40,9 +44,9 @@ class KnowledgeHub(private val dao: AppDataDao) {
             .map { it.first }
 
         return Packet(
-            blocks = ranked.map { "[KNOWLEDGE: ${it.title}]\n${it.content}" },
+            blocks = ranked.map { "[KNOWLEDGE: ${it.title} | ${it.source}]\n${it.content}" },
             sources = ranked.map { if (it.sourceUri.isBlank()) it.title else "${it.title} • ${it.sourceUri}" },
-            route = "local-knowledge → rag → brain",
+            route = "multilingual-local-knowledge → rag → brain",
             elapsedMs = System.currentTimeMillis() - started
         )
     }
@@ -51,7 +55,9 @@ class KnowledgeHub(private val dao: AppDataDao) {
         if (query.isEmpty()) return 0
         val title = tokenize(item.title)
         val body = tokenize(item.content + " " + item.keywords)
-        return query.intersect(title).size * 35 + query.intersect(body).size * 10
+        var score = query.intersect(title).size * 35 + query.intersect(body).size * 10
+        if (item.source == "learned-web") score += 3
+        return score
     }
 
     private fun chunk(text: String, max: Int): List<String> {
@@ -72,11 +78,12 @@ class KnowledgeHub(private val dao: AppDataDao) {
         return out.filter { it.isNotBlank() }
     }
 
+    /** Unicode tokenizer: Thai/English/CJK/Korean/European scripts are all retained. */
     private fun tokenize(text: String): Set<String> = text
         .lowercase()
         .replace(Regex("[^\\p{L}\\p{N}_]+"), " ")
         .split(' ')
         .map { it.trim() }
-        .filter { it.length >= 2 }
+        .filter { it.isNotEmpty() }
         .toSet()
 }
