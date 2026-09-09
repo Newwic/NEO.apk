@@ -8,10 +8,13 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.lifecycleScope
 import com.neo.assistant.ai.LocalBrain
@@ -59,9 +62,7 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             while (isActive) {
                 liveClient.fetch()?.let { cfg ->
-                    if (cfg.revision != liveConfig.revision) {
-                        liveConfig = cfg
-                    }
+                    if (cfg.revision != liveConfig.revision) liveConfig = cfg
                 }
                 delay(liveConfig.liveReloadSeconds * 1000)
             }
@@ -150,7 +151,7 @@ fun NeoScreen(
     registerSubmitter: (((String) -> Unit) -> Unit),
     registerStatus: (((String) -> Unit) -> Unit)
 ) {
-    val messages = remember { mutableStateListOf("NEO: พร้อมใช้งาน • Local First") }
+    val messages = remember { mutableStateListOf<String>() }
     var input by remember { mutableStateOf("") }
     var showSettings by remember { mutableStateOf(false) }
     var pcUrl by remember { mutableStateOf(initialPcUrl) }
@@ -164,16 +165,32 @@ fun NeoScreen(
     if (showSettings) {
         AlertDialog(
             onDismissRequest = { showSettings = false },
-            title = { Text("NEO Local Settings") },
+            shape = RoundedCornerShape(28.dp),
+            title = { Text("ตั้งค่า NEO", fontWeight = FontWeight.SemiBold) },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text("สมอง: Qwen2.5 3B Q4 • llama.cpp • ทำงานในมือถือ")
+                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                    Surface(
+                        shape = RoundedCornerShape(18.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant
+                    ) {
+                        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text("สมอง Local", fontWeight = FontWeight.SemiBold)
+                            Text("Qwen2.5 3B Q4 • llama.cpp • ทำงานบนมือถือ", style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
                     Button(onClick = onInstallBrain, modifier = Modifier.fillMaxWidth()) {
                         Text("ติดตั้ง / โหลดสมอง Local 3B")
                     }
-                    Text("PC Worker / Live Reload (ไม่จำเป็นสำหรับแชต Local)")
-                    OutlinedTextField(pcUrl, { pcUrl = it }, label = { Text("PC Worker URL") })
-                    Text("หลังดาวน์โหลดโมเดลครั้งแรกประมาณ 1.9 GB สามารถคุยกับ NEO แบบออฟไลน์ได้")
+                    OutlinedTextField(
+                        value = pcUrl,
+                        onValueChange = { pcUrl = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("PC Worker URL") },
+                        supportingText = { Text("ไม่จำเป็นสำหรับการแชต Local") },
+                        singleLine = true,
+                        shape = RoundedCornerShape(16.dp)
+                    )
+                    Text("หลังดาวน์โหลดโมเดลครั้งแรก สามารถคุยกับ NEO แบบออฟไลน์ได้", style = MaterialTheme.typography.bodySmall)
                 }
             },
             confirmButton = {
@@ -182,58 +199,181 @@ fun NeoScreen(
                     showSettings = false
                 }) { Text("บันทึก") }
             },
-            dismissButton = {
-                TextButton(onClick = { showSettings = false }) { Text("ยกเลิก") }
-            }
+            dismissButton = { TextButton(onClick = { showSettings = false }) { Text("ปิด") } }
         )
     }
 
     Scaffold(
+        containerColor = MaterialTheme.colorScheme.background,
         topBar = {
             TopAppBar(
                 title = {
-                    Column {
-                        Text("NEO • Local Assistant")
-                        Text(status, style = MaterialTheme.typography.labelSmall)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Surface(
+                            modifier = Modifier.size(38.dp),
+                            shape = CircleShape,
+                            color = MaterialTheme.colorScheme.primary
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Text("N", color = MaterialTheme.colorScheme.onPrimary, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                        Spacer(Modifier.width(10.dp))
+                        Column {
+                            Text("NEO", fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.titleMedium)
+                            Text("Local AI Assistant", style = MaterialTheme.typography.labelSmall)
+                        }
                     }
                 },
-                actions = { IconButton(onClick = { showSettings = true }) { Text("⚙") } }
+                actions = {
+                    TextButton(onClick = { showSettings = true }) { Text("⚙") }
+                }
             )
         }
     ) { padding ->
-        Column(Modifier.padding(padding).fillMaxSize().padding(16.dp)) {
-            LazyColumn(
-                modifier = Modifier.weight(1f).fillMaxWidth(),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
+        Column(
+            modifier = Modifier
+                .padding(padding)
+                .fillMaxSize()
+                .imePadding()
+        ) {
+            Surface(
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                shape = RoundedCornerShape(50),
+                color = MaterialTheme.colorScheme.surfaceVariant
             ) {
-                items(messages) {
-                    Card(Modifier.fillMaxWidth()) { Text(it, Modifier.padding(12.dp)) }
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("●", style = MaterialTheme.typography.labelSmall)
+                    Spacer(Modifier.width(7.dp))
+                    Text(status, style = MaterialTheme.typography.labelMedium)
                 }
             }
 
-            Spacer(Modifier.height(10.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                OutlinedTextField(
-                    value = input,
-                    onValueChange = { input = it },
-                    modifier = Modifier.weight(1f),
-                    placeholder = { Text("พิมพ์หา NEO...") }
-                )
-                Spacer(Modifier.width(8.dp))
-                Button(onClick = onMic) { Text("🎙") }
+            if (messages.isEmpty()) {
+                Box(
+                    modifier = Modifier.weight(1f).fillMaxWidth().padding(24.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Surface(
+                            modifier = Modifier.size(72.dp),
+                            shape = CircleShape,
+                            color = MaterialTheme.colorScheme.primary
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Text("N", color = MaterialTheme.colorScheme.onPrimary, style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                        Spacer(Modifier.height(18.dp))
+                        Text("มีอะไรให้ NEO ช่วย?", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
+                        Spacer(Modifier.height(8.dp))
+                        Text("คุย ถามข้อมูล จำสิ่งสำคัญ เปิดแอป และใช้สมอง Local บนมือถือ", style = MaterialTheme.typography.bodyMedium)
+                        Spacer(Modifier.height(20.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            SuggestionChip(onClick = { input = "นายทำอะไรได้บ้าง" }, label = { Text("ทำอะไรได้บ้าง") })
+                            SuggestionChip(onClick = { input = "จำข้อมูลนี้ให้หน่อย" }, label = { Text("ความจำ") })
+                        }
+                    }
+                }
+            } else {
+                LazyColumn(
+                    modifier = Modifier.weight(1f).fillMaxWidth(),
+                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(18.dp)
+                ) {
+                    items(messages) { raw ->
+                        NeoMessage(raw)
+                    }
+                }
             }
 
-            Spacer(Modifier.height(8.dp))
-            Button(
-                onClick = {
-                    if (input.isNotBlank()) {
-                        val t = input
-                        input = ""
-                        onSend(t)
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                tonalElevation = 3.dp
+            ) {
+                Column(Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
+                    Surface(
+                        shape = RoundedCornerShape(28.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(start = 16.dp, end = 8.dp, top = 6.dp, bottom = 6.dp),
+                            verticalAlignment = Alignment.Bottom
+                        ) {
+                            TextField(
+                                value = input,
+                                onValueChange = { input = it },
+                                modifier = Modifier.weight(1f),
+                                placeholder = { Text("ข้อความถึง NEO") },
+                                colors = TextFieldDefaults.colors(
+                                    focusedContainerColor = MaterialTheme.colorScheme.surfaceVariant,
+                                    unfocusedContainerColor = MaterialTheme.colorScheme.surfaceVariant,
+                                    disabledContainerColor = MaterialTheme.colorScheme.surfaceVariant,
+                                    focusedIndicatorColor = MaterialTheme.colorScheme.surfaceVariant,
+                                    unfocusedIndicatorColor = MaterialTheme.colorScheme.surfaceVariant
+                                ),
+                                maxLines = 5
+                            )
+                            TextButton(onClick = onMic, contentPadding = PaddingValues(8.dp)) { Text("🎙") }
+                            FilledIconButton(
+                                onClick = {
+                                    if (input.isNotBlank()) {
+                                        val text = input.trim()
+                                        input = ""
+                                        onSend(text)
+                                    }
+                                },
+                                enabled = input.isNotBlank()
+                            ) { Text("↑") }
+                        }
                     }
-                },
-                modifier = Modifier.fillMaxWidth()
-            ) { Text("ส่ง") }
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "NEO อาจตอบผิดพลาดได้ • สมอง Local ทำงานบนอุปกรณ์ของคุณ",
+                        modifier = Modifier.align(Alignment.CenterHorizontally),
+                        style = MaterialTheme.typography.labelSmall
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun NeoMessage(raw: String) {
+    val isUser = raw.startsWith("คุณ:")
+    val text = raw.substringAfter(":", raw).trim()
+
+    if (isUser) {
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+            Surface(
+                modifier = Modifier.widthIn(max = 310.dp),
+                shape = RoundedCornerShape(22.dp),
+                color = MaterialTheme.colorScheme.primaryContainer
+            ) {
+                Text(text, Modifier.padding(horizontal = 16.dp, vertical = 12.dp))
+            }
+        }
+    } else {
+        Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
+            Surface(
+                modifier = Modifier.size(32.dp),
+                shape = CircleShape,
+                color = MaterialTheme.colorScheme.primary
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Text("N", color = MaterialTheme.colorScheme.onPrimary, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelMedium)
+                }
+            }
+            Spacer(Modifier.width(10.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text("NEO", fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.labelLarge)
+                Spacer(Modifier.height(4.dp))
+                Text(text, style = MaterialTheme.typography.bodyLarge)
+            }
         }
     }
 }
