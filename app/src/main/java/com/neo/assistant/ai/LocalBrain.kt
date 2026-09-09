@@ -7,6 +7,7 @@ import dev.ffmpegkit.llama.Llama
 import dev.ffmpegkit.llama.LlamaConfig
 import dev.ffmpegkit.llama.LlamaModel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -23,7 +24,7 @@ class LocalBrain(private val context: Context) {
         private const val MODEL_FILE = "Qwen2.5-7B-Instruct-Q4_K_M.gguf"
         private const val MODEL_URL = "https://huggingface.co/lmstudio-community/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_K_M.gguf?download=true"
         private const val MIN_MODEL_BYTES = 4_000_000_000L
-        private const val INFERENCE_TIMEOUT_SECONDS = 75L
+        private const val INFERENCE_TIMEOUT_SECONDS = 60L
     }
 
     private val mutex = Mutex()
@@ -55,8 +56,7 @@ class LocalBrain(private val context: Context) {
             model = Llama.loadModel(
                 modelPath = file.absolutePath,
                 config = LlamaConfig(
-                    // Smaller context/token budget for phone CPU/RAM stability.
-                    contextSize = 1024,
+                    contextSize = 768,
                     threads = Runtime.getRuntime().availableProcessors().coerceIn(4, 5),
                     gpuLayers = 0,
                     temperature = 0.62f,
@@ -132,46 +132,49 @@ class LocalBrain(private val context: Context) {
         extraContext: List<String> = emptyList(),
         onStatus: (String) -> Unit = {}
     ): String = withContext(Dispatchers.IO) {
+        fastPath(message, memories, extraContext)?.let {
+            onStatus("LOCAL • ตอบจากข้อมูลโดยตรง")
+            return@withContext it
+        }
+
         val webBlocks = extraContext.filter { it.startsWith("[WEB ") }
         if (webBlocks.isNotEmpty()) return@withContext buildDirectWebAnswer(message, webBlocks)
 
         if (inferenceTimedOut) {
-            return@withContext "สมอง 7B เคยค้างในรอบนี้ครับ กรุณาปิด NEO แล้วเปิดใหม่ หรือใช้ Web/Knowledge ก่อน ระหว่างที่ปรับโหมด 7B ให้เหมาะกับเครื่อง"
+            return@withContext buildFallback(memories, extraContext,
+                "สมอง 7B ยังไม่พร้อมหลังจากรอบก่อนใช้เวลานานเกินกำหนด")
         }
 
         if (!prepare(onStatus)) {
-            if (extraContext.isNotEmpty()) {
-                return@withContext "ผมพบข้อมูลใน Knowledge แล้ว แต่สมอง Local 7B ยังไม่พร้อมครับ\n\n" +
-                    extraContext.take(4).joinToString("\n\n") { it.take(700) }
-            }
-            return@withContext "ยังติดตั้งสมอง Local 7B ไม่สำเร็จครับ ต้องมีพื้นที่ว่างอย่างน้อยประมาณ 6 GB และ RAM ว่างพอ"
+            return@withContext buildFallback(memories, extraContext,
+                "สมอง Local 7B ยังโหลดไม่สำเร็จ")
         }
 
-        val memoryText = memories.take(8).joinToString("\n") {
-            "[${it.category} | ${it.source}→${it.destination} | p${it.importance}] ${it.text.take(350)}"
+        val memoryText = memories.take(6).joinToString("\n") {
+            "[${it.category} | p${it.importance}] ${it.text.take(220)}"
         }
-        val contextText = extraContext.take(4).joinToString("\n\n") { it.take(600) }
+        val contextText = extraContext.take(3).joinToString("\n\n") { it.take(450) }
         val system = buildString {
-            append(cfg.systemPrompt)
-            append("\nคุณชื่อ NEO เป็นผู้ช่วยส่วนตัวของผู้ใช้ ตอบภาษาไทยเป็นหลัก เว้นแต่ผู้ใช้ขอภาษาอื่น")
-            append("\nคุณทำงานบนมือถือแบบ Local และสามารถใช้ Memory กับ Local Knowledge")
-            append("\nตอบสั้น กระชับ และตรงคำถาม เพื่อลดเวลาประมวลผลบนมือถือ")
-            append("\nห้ามแต่งข้อมูล หากข้อมูลไม่พอให้บอกตรง ๆ")
-            if (memoryText.isNotBlank()) append("\n\nMEMORY ROUTE DATA:\n$memoryText")
-            if (contextText.isNotBlank()) append("\n\nRAG CONTEXT:\n$contextText")
+            append(cfg.systemPrompt.take(2200))
+            append("\nคุณชื่อ NEO เป็นผู้ช่วยส่วนตัวของผู้ใช้ ตอบภาษาไทยเป็นหลัก")
+            append("\nตอบสั้น ตรงคำถาม ใช้ Memory/RAG ที่ให้มา ห้ามแต่งข้อมูล")
+            if (memoryText.isNotBlank()) append("\nMEMORY:\n$memoryText")
+            if (contextText.isNotBlank()) append("\nRAG:\n$contextText")
         }
 
-        val current = model ?: return@withContext "สมอง Local ยังไม่พร้อมครับ"
-        onStatus("LOCAL • 7B กำลังสร้างคำตอบ • จำกัด ${INFERENCE_TIMEOUT_SECONDS}s")
+        val current = model ?: return@withContext buildFallback(memories, extraContext, "สมอง Local ยังไม่พร้อม")
+        onStatus("LOCAL • 7B กำลังสร้างคำตอบ • สูงสุด ${INFERENCE_TIMEOUT_SECONDS}s")
 
         val future = inferenceExecutor.submit<String> {
-            val result = Llama.complete(
-                model = current,
-                prompt = message.take(1200),
-                systemPrompt = system.take(7000),
-                maxTokens = cfg.maxTokens.coerceIn(48, 128)
-            )
-            result.text.trim().ifBlank { "ผมยังคิดคำตอบไม่ออกครับ ลองถามใหม่อีกครั้ง" }
+            runBlocking {
+                val result = Llama.complete(
+                    model = current,
+                    prompt = message.take(700),
+                    systemPrompt = system.take(4200),
+                    maxTokens = cfg.maxTokens.coerceIn(40, 96)
+                )
+                result.text.trim().ifBlank { "ผมยังคิดคำตอบไม่ออกครับ ลองถามใหม่อีกครั้ง" }
+            }
         }
 
         try {
@@ -181,12 +184,42 @@ class LocalBrain(private val context: Context) {
         } catch (_: TimeoutException) {
             inferenceTimedOut = true
             future.cancel(true)
-            onStatus("LOCAL • 7B ใช้เวลานานเกิน 75s • หยุดรอแล้ว")
-            "สมอง 7B ใช้เวลานานเกิน 75 วินาทีบนเครื่องนี้ ผมหยุดรอเพื่อไม่ให้แอปค้างครับ ข้อมูล Memory/RAG ยังทำงานปกติ — รอบถัดไปควรใช้โหมด 3B/7B Auto"
+            onStatus("LOCAL • 7B ช้าเกิน ${INFERENCE_TIMEOUT_SECONDS}s • ใช้ fallback")
+            buildFallback(memories, extraContext, "7B ใช้เวลานานเกิน ${INFERENCE_TIMEOUT_SECONDS} วินาที")
         } catch (e: Throwable) {
             future.cancel(true)
             onStatus("LOCAL • 7B error • ${e.javaClass.simpleName}")
-            "สมอง Local 7B มีปัญหาระหว่างประมวลผล (${e.javaClass.simpleName}) ครับ"
+            buildFallback(memories, extraContext, "7B error: ${e.javaClass.simpleName}")
+        }
+    }
+
+    private fun fastPath(message: String, memories: List<MemoryEntity>, extraContext: List<String>): String? {
+        val q = message.lowercase().trim()
+        if (q.contains("นายชื่ออะไร") || q.contains("ชื่อของนาย") || q == "ชื่ออะไร") {
+            return "ผมชื่อ NEO ครับ เป็นผู้ช่วย AI ส่วนตัวของคุณ"
+        }
+        if (memories.isNotEmpty() && (q.contains("จำอะไร") || q.contains("ข้อมูลที่จำ") || q.contains("รายชื่ออะไร") || q.contains("ชื่ออะไร"))) {
+            val selected = memories.take(5).map { it.text.trim() }.filter { it.isNotBlank() }
+            if (selected.isNotEmpty()) return "ข้อมูลที่ผมดึงจากความจำได้ตอนนี้:\n" + selected.joinToString("\n") { "• $it" }
+        }
+        if (extraContext.isNotEmpty() && (q.contains("จากข้อมูล") || q.contains("ในไฟล์") || q.contains("knowledge"))) {
+            return "ข้อมูลที่เกี่ยวข้องที่ผมพบ:\n\n" + extraContext.take(3).joinToString("\n\n") { it.take(600) }
+        }
+        return null
+    }
+
+    private fun buildFallback(memories: List<MemoryEntity>, extraContext: List<String>, reason: String): String {
+        val parts = mutableListOf<String>()
+        if (memories.isNotEmpty()) {
+            parts += "Memory ที่เกี่ยวข้อง:\n" + memories.take(4).joinToString("\n") { "• ${it.text.take(300)}" }
+        }
+        if (extraContext.isNotEmpty()) {
+            parts += "Knowledge/RAG ที่เกี่ยวข้อง:\n" + extraContext.take(3).joinToString("\n\n") { it.take(500) }
+        }
+        return if (parts.isEmpty()) {
+            "$reason ครับ แต่แอปไม่ค้างแล้ว คุณยังใช้ Memory, Knowledge และ Web ได้ตามปกติ"
+        } else {
+            "$reason ครับ ผมจึงตอบจากข้อมูลที่ดึงได้โดยตรงก่อน:\n\n" + parts.joinToString("\n\n")
         }
     }
 
