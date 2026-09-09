@@ -21,7 +21,7 @@ import com.neo.assistant.ai.LocalBrain
 import com.neo.assistant.config.NeoSettings
 import com.neo.assistant.dev.LiveConfigClient
 import com.neo.assistant.dev.NeoLiveConfig
-import com.neo.assistant.memory.MemoryEntity
+import com.neo.assistant.memory.MemoryHub
 import com.neo.assistant.memory.NeoDatabase
 import com.neo.assistant.pc.PcWorkerClient
 import com.neo.assistant.tools.AppTools
@@ -36,10 +36,11 @@ class MainActivity : ComponentActivity() {
     private lateinit var settings: NeoSettings
     private lateinit var brain: LocalBrain
     private lateinit var liveClient: LiveConfigClient
+    private lateinit var memoryHub: MemoryHub
     @Volatile private var liveConfig = NeoLiveConfig()
     private var submitMessage: ((String) -> Unit)? = null
     private var updateStatus: ((String) -> Unit)? = null
-    private var lastBrainStatus: String = "LOCAL • เตรียมสมอง 3B"
+    private var lastBrainStatus: String = "LOCAL • เตรียมสมอง 7B"
 
     private val speechLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         if (result.resultCode == Activity.RESULT_OK) {
@@ -53,6 +54,7 @@ class MainActivity : ComponentActivity() {
         settings = NeoSettings(this)
         brain = LocalBrain(this)
         liveClient = LiveConfigClient(settings.pcWorkerUrl)
+        memoryHub = MemoryHub(NeoDatabase.get(this).memoryDao())
 
         lifecycleScope.launch {
             delay(500)
@@ -97,8 +99,9 @@ class MainActivity : ComponentActivity() {
     private fun onUserMessage(text: String) {
         submitMessage?.invoke("คุณ: $text")
         lifecycleScope.launch {
-            val dao = NeoDatabase.get(this@MainActivity).memoryDao()
-            if (text.contains("จำ")) dao.insert(MemoryEntity(text = text))
+            if (text.contains("จำ")) {
+                memoryHub.save(text, source = "user", destination = "brain")
+            }
 
             Regex("เปิด\\s*(.+)").find(text)?.let { match ->
                 if (!text.contains("โปรเจกต์")) {
@@ -121,9 +124,13 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            setBrainStatus("LOCAL • NEO กำลังคิด…")
-            val answer = brain.generate(text, dao.recent().map { it.text }, cfg)
-            setBrainStatus("LOCAL • Qwen2.5 3B พร้อมใช้งาน")
+            setBrainStatus("MEM • กำลังดึงข้อมูลหลายทางพร้อมกัน…")
+            val packet = memoryHub.retrieve(text)
+            submitMessage?.invoke("TRACE: ${packet.route} • ${packet.memories.size} รายการ • ${packet.elapsedMs} ms")
+
+            setBrainStatus("LOCAL • NEO 7B กำลังคิด…")
+            val answer = brain.generate(text, packet.memories, cfg)
+            setBrainStatus("LOCAL • Qwen2.5 7B พร้อมใช้งาน")
             reply(answer)
         }
     }
@@ -155,7 +162,7 @@ fun NeoScreen(
     var input by remember { mutableStateOf("") }
     var showSettings by remember { mutableStateOf(false) }
     var pcUrl by remember { mutableStateOf(initialPcUrl) }
-    var status by remember { mutableStateOf("LOCAL • เตรียมสมอง 3B") }
+    var status by remember { mutableStateOf("LOCAL • เตรียมสมอง 7B") }
 
     LaunchedEffect(Unit) {
         registerSubmitter { messages.add(it) }
@@ -175,11 +182,12 @@ fun NeoScreen(
                     ) {
                         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                             Text("สมอง Local", fontWeight = FontWeight.SemiBold)
-                            Text("Qwen2.5 3B Q4 • llama.cpp • ทำงานบนมือถือ", style = MaterialTheme.typography.bodySmall)
+                            Text("Qwen2.5 7B Q4 • llama.cpp • ทำงานบนมือถือ", style = MaterialTheme.typography.bodySmall)
+                            Text("Memory Hub: recent + category + source → brain แบบขนาน", style = MaterialTheme.typography.bodySmall)
                         }
                     }
                     Button(onClick = onInstallBrain, modifier = Modifier.fillMaxWidth()) {
-                        Text("ติดตั้ง / โหลดสมอง Local 3B")
+                        Text("ติดตั้ง / โหลดสมอง Local 7B")
                     }
                     OutlinedTextField(
                         value = pcUrl,
@@ -190,7 +198,7 @@ fun NeoScreen(
                         singleLine = true,
                         shape = RoundedCornerShape(16.dp)
                     )
-                    Text("หลังดาวน์โหลดโมเดลครั้งแรก สามารถคุยกับ NEO แบบออฟไลน์ได้", style = MaterialTheme.typography.bodySmall)
+                    Text("7B ใช้พื้นที่หลาย GB และ RAM มากกว่า 3B แต่ตอบและเขียนโค้ดได้ดีขึ้น", style = MaterialTheme.typography.bodySmall)
                 }
             },
             confirmButton = {
@@ -221,13 +229,11 @@ fun NeoScreen(
                         Spacer(Modifier.width(10.dp))
                         Column {
                             Text("NEO", fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.titleMedium)
-                            Text("Local AI Assistant", style = MaterialTheme.typography.labelSmall)
+                            Text("Local 7B • Routed Memory", style = MaterialTheme.typography.labelSmall)
                         }
                     }
                 },
-                actions = {
-                    TextButton(onClick = { showSettings = true }) { Text("⚙") }
-                }
+                actions = { TextButton(onClick = { showSettings = true }) { Text("⚙") } }
             )
         }
     ) { padding ->
@@ -270,7 +276,7 @@ fun NeoScreen(
                         Spacer(Modifier.height(18.dp))
                         Text("มีอะไรให้ NEO ช่วย?", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
                         Spacer(Modifier.height(8.dp))
-                        Text("คุย ถามข้อมูล จำสิ่งสำคัญ เปิดแอป และใช้สมอง Local บนมือถือ", style = MaterialTheme.typography.bodyMedium)
+                        Text("7B Local AI + Memory Hub ที่ดึงข้อมูลหลายต้นทางพร้อมกัน", style = MaterialTheme.typography.bodyMedium)
                         Spacer(Modifier.height(20.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             SuggestionChip(onClick = { input = "นายทำอะไรได้บ้าง" }, label = { Text("ทำอะไรได้บ้าง") })
@@ -284,21 +290,13 @@ fun NeoScreen(
                     contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
                     verticalArrangement = Arrangement.spacedBy(18.dp)
                 ) {
-                    items(messages) { raw ->
-                        NeoMessage(raw)
-                    }
+                    items(messages) { raw -> NeoMessage(raw) }
                 }
             }
 
-            Surface(
-                modifier = Modifier.fillMaxWidth(),
-                tonalElevation = 3.dp
-            ) {
+            Surface(modifier = Modifier.fillMaxWidth(), tonalElevation = 3.dp) {
                 Column(Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
-                    Surface(
-                        shape = RoundedCornerShape(28.dp),
-                        color = MaterialTheme.colorScheme.surfaceVariant
-                    ) {
+                    Surface(shape = RoundedCornerShape(28.dp), color = MaterialTheme.colorScheme.surfaceVariant) {
                         Row(
                             modifier = Modifier.padding(start = 16.dp, end = 8.dp, top = 6.dp, bottom = 6.dp),
                             verticalAlignment = Alignment.Bottom
@@ -332,7 +330,7 @@ fun NeoScreen(
                     }
                     Spacer(Modifier.height(6.dp))
                     Text(
-                        "NEO อาจตอบผิดพลาดได้ • สมอง Local ทำงานบนอุปกรณ์ของคุณ",
+                        "NEO • Local 7B • ข้อมูลและความจำอยู่บนอุปกรณ์ของคุณ",
                         modifier = Modifier.align(Alignment.CenterHorizontally),
                         style = MaterialTheme.typography.labelSmall
                     )
@@ -344,6 +342,21 @@ fun NeoScreen(
 
 @Composable
 private fun NeoMessage(raw: String) {
+    if (raw.startsWith("TRACE:")) {
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(14.dp),
+            color = MaterialTheme.colorScheme.surfaceVariant
+        ) {
+            Text(
+                "↔ ${raw.removePrefix("TRACE:").trim()}",
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                style = MaterialTheme.typography.labelMedium
+            )
+        }
+        return
+    }
+
     val isUser = raw.startsWith("คุณ:")
     val text = raw.substringAfter(":", raw).trim()
 
@@ -359,11 +372,7 @@ private fun NeoMessage(raw: String) {
         }
     } else {
         Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
-            Surface(
-                modifier = Modifier.size(32.dp),
-                shape = CircleShape,
-                color = MaterialTheme.colorScheme.primary
-            ) {
+            Surface(modifier = Modifier.size(32.dp), shape = CircleShape, color = MaterialTheme.colorScheme.primary) {
                 Box(contentAlignment = Alignment.Center) {
                     Text("N", color = MaterialTheme.colorScheme.onPrimary, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelMedium)
                 }
