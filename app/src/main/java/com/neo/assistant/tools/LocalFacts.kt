@@ -17,24 +17,28 @@ object LocalFacts {
         java.time.DayOfWeek.SUNDAY to "วันอาทิตย์"
     )
 
+    fun isLocalFactQuestion(query: String): Boolean = answer(query) != null
+
     fun answer(query: String): String? {
-        val q = query.lowercase().replace(" ", "")
+        val q = query.lowercase().replace(Regex("\\s+"), "")
         val now = LocalDateTime.now()
 
-        if (listOf("ตอนนี้กี่โมง", "กี่โมงแล้ว", "เวลาเท่าไหร่", "เวลาตอนนี้").any { q.contains(it.replace(" ", "")) }) {
-            return "ตอนนี้ ${now.format(DateTimeFormatter.ofPattern("HH:mm"))} น."
-        }
+        val asksTime = listOf(
+            "ตอนนี้กี่โมง", "กี่โมงแล้ว", "เวลาเท่าไหร่", "เวลาตอนนี้", "ตอนนี้เวลา",
+            "ตอนนี้เวลาเท่าไร", "ตอนนี้เวลาเท่าไหร่", "เวลาอะไร", "ขอเวลา", "กี่โมง"
+        ).any { q.contains(it.replace(" ", "")) }
+        if (asksTime) return "ตอนนี้ ${now.format(DateTimeFormatter.ofPattern("HH:mm"))} น."
 
-        if (listOf("วันนี้วันอะไร", "วันนี้วันไหน").any { q.contains(it.replace(" ", "")) }) {
-            return "วันนี้${dayNames[now.dayOfWeek]}ครับ"
-        }
+        val asksToday = listOf("วันนี้วันอะไร", "วันนี้วันไหน", "วันนี้วัน").any { q.contains(it.replace(" ", "")) }
+        if (asksToday) return "วันนี้${dayNames[now.dayOfWeek]}ครับ"
 
-        if (listOf("พรุ่งนี้วันอะไร", "พรุ่งนี้วันไหน").any { q.contains(it.replace(" ", "")) }) {
+        val asksTomorrow = listOf("พรุ่งนี้วันอะไร", "พรุ่งนี้วันไหน", "พรุ่งนี้เป็นวันอะไร").any { q.contains(it.replace(" ", "")) }
+        if (asksTomorrow) {
             val tomorrow = LocalDate.now().plusDays(1)
             return "พรุ่งนี้${dayNames[tomorrow.dayOfWeek]}ครับ"
         }
 
-        if (q.contains("วันที่เท่าไหร่") || q.contains("วันนี้วันที่")) {
+        if (q.contains("วันที่เท่าไหร่") || q.contains("วันนี้วันที่") || q == "วันที่") {
             return "วันนี้วันที่ ${now.format(DateTimeFormatter.ofPattern("d MMMM yyyy", th))}"
         }
 
