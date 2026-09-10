@@ -46,4 +46,34 @@ class WebSearchClientTest {
             "HTTP คืออะไร"
         ).forEach { q -> assertTrue("Knowledge question should permit verified fallback: $q", client.canFallbackSearch(q)) }
     }
+
+    @Test fun irrelevantWebResultsAreScoredLow() {
+        val wrongMusic = WebSearchClient.Result(
+            title = "เพลงฮิตประจำสัปดาห์",
+            snippet = "รวมเพลงและศิลปินยอดนิยม พร้อมเนื้อเพลงใหม่",
+            url = "https://example.com/music"
+        )
+        val rightCode = WebSearchClient.Result(
+            title = "Kotlin programming language",
+            snippet = "Kotlin is a programming language used to write Android applications and other software.",
+            url = "https://example.com/kotlin"
+        )
+        assertTrue(client.relevanceScore("เขียน Kotlin ได้ไหม", wrongMusic) < 0.5)
+        assertTrue(client.relevanceScore("เขียน Kotlin ได้ไหม", rightCode) >= 0.5)
+    }
+
+    @Test fun topicMismatchCannotLookRelevantJustBecauseQuestionWordsMatch() {
+        val wrong = WebSearchClient.Result(
+            title = "ดาราคนนี้คือใคร",
+            snippet = "ประวัติและผลงานของนักแสดงชื่อดัง",
+            url = "https://example.com/actor"
+        )
+        val right = WebSearchClient.Result(
+            title = "GPU",
+            snippet = "GPU หรือหน่วยประมวลผลกราฟิกประกอบด้วยหน่วยคำนวณ หน่วยความจำ และวงจรควบคุม",
+            url = "https://example.com/gpu"
+        )
+        assertTrue(client.relevanceScore("GPU คืออะไร", wrong) < 0.5)
+        assertTrue(client.relevanceScore("GPU คืออะไร", right) >= 0.5)
+    }
 }
