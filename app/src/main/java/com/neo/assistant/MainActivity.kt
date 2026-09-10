@@ -328,7 +328,10 @@ fun NeoScreen(
 @Composable
 private fun EmptyNeoState() {
     Column(
-        Modifier.fillMaxWidth().padding(top = 80.dp, horizontal = 28.dp),
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 28.dp)
+            .padding(top = 80.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Box(
