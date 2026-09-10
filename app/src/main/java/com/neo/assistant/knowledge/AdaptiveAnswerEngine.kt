@@ -2,7 +2,7 @@ package com.neo.assistant.knowledge
 
 import com.neo.assistant.web.WebSearchClient
 
-/** Evidence-first web recovery. General knowledge stays with the local 7B model. */
+/** Evidence-first web recovery. General knowledge stays with the local 7B model unless forceWeb=true. */
 class AdaptiveAnswerEngine(
     private val knowledgeHub: KnowledgeHub,
     private val webSearch: WebSearchClient = WebSearchClient()
@@ -10,15 +10,14 @@ class AdaptiveAnswerEngine(
     data class Answer(val text:String,val route:String,val learned:Boolean,val sources:List<String>)
     @Volatile private var lastWebQuestion: String? = null
 
-    suspend fun answer(query: String): Answer? {
+    suspend fun answer(query: String, forceWeb: Boolean = false): Answer? {
         val raw=query.trim()
         if(raw.length<2) return null
-
-        // Do not web-search ordinary knowledge. Qwen should answer these first.
-        // Web is reserved for explicitly fresh/current/search requests or recovery after local failure.
         val q=resolveFollowUp(raw)
+
+        // Conversational/meta prompts should remain conversational, never become search snippets.
         if(isConversationalOrAbility(raw) && q==raw) return null
-        if(!needsFreshWeb(q)) return null
+        if(!forceWeb && !needsFreshWeb(q)) return null
         if(!webSearch.canFallbackSearch(q)) return null
 
         val cached=knowledgeHub.retrieve(q,limit=6)
@@ -30,12 +29,12 @@ class AdaptiveAnswerEngine(
             .filter{it.title.isNotBlank()&&it.snippet.isNotBlank()}
             .distinctBy{it.url}
             .map{it to relevance(q,"${it.title} ${it.snippet}")}
-            .filter{it.second>=0.32}
+            .filter{it.second>=if(forceWeb) 0.38 else 0.32}
             .sortedByDescending{it.second}
             .take(3)
         if(ranked.isEmpty()) return null
-        // Require a strong top match. Weak snippets must never become learned truth.
-        if(ranked.first().second<0.42) return null
+        if(ranked.first().second < if(forceWeb) 0.50 else 0.42) return null
+
         val relevant=ranked.map{it.first}
         val answerText=clean(relevant.first().snippet).take(650)
         if(answerText.length<12) return null
@@ -43,7 +42,7 @@ class AdaptiveAnswerEngine(
         runCatching{knowledgeHub.importText("Q: $q","คำถาม: $q\nคำตอบ: $answerText\nแหล่งข้อมูล:\n$sourceText",relevant.first().url,"learned-answer")}
         relevant.forEach{r->runCatching{knowledgeHub.learnWeb(r.title,r.snippet,r.url)}}
         lastWebQuestion=q
-        return Answer(answerText,"WEB → verified evidence → local cache",true,relevant.map{it.url})
+        return Answer(answerText, if(forceWeb) "LOCAL FAILED → VERIFIED WEB → CACHE" else "WEB → verified evidence → local cache",true,relevant.map{it.url})
     }
 
     private fun resolveFollowUp(raw:String):String {
@@ -69,8 +68,8 @@ class AdaptiveAnswerEngine(
 
     private fun isConversationalOrAbility(query:String):Boolean {
         val q=query.lowercase().replace(Regex("\\s+"),"")
-        val p=listOf("ทำได้ไหม","ได้ไหม","เขียนcode","เขียนโค้ด","ช่วยได้","ช่วยอะไร","ทำอะไรได้","เก่งอะไร","ตอบไม่ตรง","ตอบมั่ว","เข้าใจไหม","canyou","areyou","doyou")
-        return p.any{q.contains(it)}&&q.length<55
+        val p=listOf("ทำได้ไหม","ได้ไหม","เขียนcode","เขียนโค้ด","ช่วยได้","ช่วยอะไร","ทำอะไรได้","เก่งอะไร","ตอบไม่ตรง","ตอบมั่ว","เข้าใจไหม","ตอบช้า","ทำไมช้า","ช้าจัง","canyou","areyou","doyou")
+        return p.any{q.contains(it)}&&q.length<80
     }
 
     private fun relevance(query:String,evidence:String):Double {
