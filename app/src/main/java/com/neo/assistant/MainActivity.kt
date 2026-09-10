@@ -40,6 +40,7 @@ import com.neo.assistant.voice.NeoSpeechRecognizer
 import com.neo.assistant.voice.NeoTts
 import com.neo.assistant.web.WebSearchClient
 import kotlinx.coroutines.async
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -56,6 +57,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var appDataDao: AppDataDao
 
     private val webSearch = WebSearchClient()
+    private val messageQueue = Channel<String>(Channel.UNLIMITED)
     @Volatile private var liveConfig = NeoLiveConfig()
     private var submitMessage: ((String) -> Unit)? = null
     private var updateStatus: ((String) -> Unit)? = null
@@ -89,6 +91,13 @@ class MainActivity : ComponentActivity() {
             while (isActive) {
                 liveClient.fetch()?.let { liveConfig = it }
                 delay(3000)
+            }
+        }
+
+        // Single consumer: every message is processed exactly once and in send order.
+        lifecycleScope.launch {
+            for (text in messageQueue) {
+                processUserMessage(text)
             }
         }
 
@@ -126,82 +135,86 @@ class MainActivity : ComponentActivity() {
         if (text.isBlank()) return
         submitMessage?.invoke("คุณ: $text")
         lifecycleScope.launch {
-            try {
-                runCatching { appDataDao.insertChat(ChatEntity(role = "user", text = text)) }
+            messageQueue.send(text)
+        }
+    }
 
-                // Truly local facts/identity always win and never need network access.
-                NeoIdentity.answer(text)?.let {
-                    safeReply(it)
-                    return@launch
-                }
-                LocalFacts.answer(text)?.let {
-                    safeReply(it)
-                    return@launch
-                }
+    private suspend fun processUserMessage(text: String) {
+        try {
+            runCatching { appDataDao.insertChat(ChatEntity(role = "user", text = text)) }
 
-                if (text.contains("จำ")) runCatching { memoryHub.save(text, "user", "brain") }
-
-                // Unknown/general questions are grounded outside the hard-coded app logic.
-                // AdaptiveAnswerEngine checks learned local cache first. If it misses, it searches
-                // the web, returns evidence-only text and stores the answer for the next question.
-                if (webSearch.canFallbackSearch(text)) {
-                    setBrainStatus("RAG • กำลังตรวจความรู้ที่เคยเรียน…")
-                    val adaptive = runCatching { adaptiveEngine.answer(text) }.getOrNull()
-                    if (adaptive != null && adaptive.text.isNotBlank()) {
-                        setBrainStatus(
-                            if (adaptive.learned) "WEB • เรียนรู้และบันทึกคำตอบแล้ว"
-                            else "LOCAL • ดึงคำตอบจากความรู้ที่จำไว้"
-                        )
-                        safeReply(adaptive.text)
-                        return@launch
-                    }
-                }
-
-                // If external evidence is unavailable, fall back to the local 7B pipeline.
-                setBrainStatus("NEO • กำลังคิด…")
-                val routed = coroutineScope {
-                    val m = async { runCatching { memoryHub.retrieve(text) }.getOrNull() }
-                    val k = async { runCatching { knowledgeHub.retrieve(text) }.getOrNull() }
-                    val w = async {
-                        if (webSearch.shouldSearch(text)) runCatching { webSearch.search(text) }.getOrNull() else null
-                    }
-                    Triple(m.await(), k.await(), w.await())
-                }
-
-                val memories = routed.first?.memories.orEmpty()
-                val blocks = mutableListOf<String>()
-                blocks.addAll(routed.second?.blocks.orEmpty())
-                routed.third?.results?.take(3)?.forEachIndexed { i, r ->
-                    blocks.add("[WEB ${i + 1}: ${r.title}]\n${r.snippet}\nSOURCE: ${r.url}")
-                }
-
-                val answer = runCatching {
-                    brain.generate(text, memories, liveConfig, blocks, ::setBrainStatus)
-                }.getOrElse {
-                    "ขออภัย ระบบสมองมีปัญหาชั่วคราว แต่แอปยังทำงานอยู่ครับ"
-                }
-
-                // One final recovery attempt. This catches local inference failures without
-                // hard-coding a particular topic such as YouTube, food, science, etc.
-                val failedLocal = answer.isBlank() ||
-                    answer.contains("สมอง Local ยังสร้างคำตอบไม่ได้") ||
-                    answer.contains("ระบบสมองมีปัญหา")
-
-                if (failedLocal && webSearch.canFallbackSearch(text)) {
-                    setBrainStatus("WEB • Local ตอบไม่ได้ กำลังค้นคำตอบ…")
-                    val recovered = runCatching { adaptiveEngine.answer(text) }.getOrNull()
-                    if (recovered != null && recovered.text.isNotBlank()) {
-                        safeReply(recovered.text)
-                        return@launch
-                    }
-                }
-
-                safeReply(answer.ifBlank { "ยังไม่พบข้อมูลที่เพียงพอสำหรับตอบคำถามนี้ครับ" })
-            } catch (e: Throwable) {
-                safeReply("เกิดข้อผิดพลาด ${e.javaClass.simpleName} — ลองส่งอีกครั้งครับ")
-            } finally {
-                setBrainStatus("LOCAL • NEO พร้อมใช้งาน")
+            NeoIdentity.answer(text)?.let {
+                safeReply(it)
+                return
             }
+            LocalFacts.answer(text)?.let {
+                safeReply(it)
+                return
+            }
+
+            if (text.contains("จำ")) runCatching { memoryHub.save(text, "user", "brain") }
+
+            // Only fresh/current questions are allowed to take the adaptive web-first route.
+            if (webSearch.canFallbackSearch(text)) {
+                setBrainStatus("RAG • กำลังตรวจความรู้ที่เคยเรียน…")
+                val adaptive = runCatching { adaptiveEngine.answer(text) }.getOrNull()
+                if (adaptive != null && adaptive.text.isNotBlank()) {
+                    setBrainStatus(if (adaptive.learned) "WEB • เรียนรู้และบันทึกคำตอบแล้ว" else "LOCAL • ดึงคำตอบจากความรู้ที่จำไว้")
+                    safeReply(adaptive.text)
+                    return
+                }
+            }
+
+            setBrainStatus("NEO • กำลังคิด…")
+            val routed = coroutineScope {
+                val m = async { runCatching { memoryHub.retrieve(text) }.getOrNull() }
+                val k = async { runCatching { knowledgeHub.retrieve(text) }.getOrNull() }
+                val w = async {
+                    if (webSearch.shouldSearch(text)) runCatching { webSearch.search(text) }.getOrNull() else null
+                }
+                Triple(m.await(), k.await(), w.await())
+            }
+
+            val memories = routed.first?.memories.orEmpty()
+            val blocks = mutableListOf<String>()
+            blocks.addAll(routed.second?.blocks.orEmpty())
+
+            // Explicitly provide the latest dialogue to the local model as context.
+            runCatching {
+                appDataDao.recentChats(10).asReversed().dropLast(1).takeLast(8).forEach {
+                    blocks.add("[CHAT] ${if (it.role == "user") "ผู้ใช้" else "NEO"}: ${it.text.take(220)}")
+                }
+            }
+
+            routed.third?.results?.take(3)?.forEachIndexed { i, r ->
+                blocks.add("[WEB ${i + 1}: ${r.title}]\n${r.snippet}\nSOURCE: ${r.url}")
+            }
+
+            val answer = runCatching {
+                brain.generate(text, memories, liveConfig, blocks, ::setBrainStatus)
+            }.getOrElse {
+                "ขออภัย ระบบสมองมีปัญหาชั่วคราว แต่แอปยังทำงานอยู่ครับ"
+            }
+
+            val failedLocal = answer.isBlank() ||
+                answer.contains("สมอง Local ยังสร้างคำตอบไม่ได้") ||
+                answer.contains("ประมวลผล Local ไม่สำเร็จ") ||
+                answer.contains("ระบบสมองมีปัญหา")
+
+            if (failedLocal && webSearch.canFallbackSearch(text)) {
+                setBrainStatus("WEB • Local ตอบไม่ได้ กำลังค้นคำตอบ…")
+                val recovered = runCatching { adaptiveEngine.answer(text) }.getOrNull()
+                if (recovered != null && recovered.text.isNotBlank()) {
+                    safeReply(recovered.text)
+                    return
+                }
+            }
+
+            safeReply(answer.ifBlank { "ยังไม่พบข้อมูลที่เพียงพอสำหรับตอบคำถามนี้ครับ" })
+        } catch (e: Throwable) {
+            safeReply("เกิดข้อผิดพลาด ${e.javaClass.simpleName} — ลองส่งอีกครั้งครับ")
+        } finally {
+            setBrainStatus(if (messageQueue.isEmpty) "LOCAL • NEO พร้อมใช้งาน" else "NEO • มีคำถามรอตอบ…")
         }
     }
 
@@ -212,6 +225,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        messageQueue.close()
         runCatching { brain.release() }
         runCatching { neoTts.shutdown() }
         super.onDestroy()
@@ -268,27 +282,16 @@ fun NeoScreen(
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = NeoDark),
                 title = {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(
-                            Modifier.size(38.dp).clip(CircleShape).background(NeoGreen),
-                            contentAlignment = Alignment.Center
-                        ) {
+                        Box(Modifier.size(38.dp).clip(CircleShape).background(NeoGreen), contentAlignment = Alignment.Center) {
                             Text("N", color = Color.Black, fontWeight = FontWeight.Black)
                         }
                         Spacer(Modifier.width(11.dp))
                         Column {
                             Text("NEO", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                Box(
-                                    Modifier.size(7.dp).clip(CircleShape).background(
-                                        if (status.contains("พร้อม") || status.contains("จำไว้")) NeoGreen else Color(0xFFF59E0B)
-                                    )
-                                )
+                                Box(Modifier.size(7.dp).clip(CircleShape).background(if (status.contains("พร้อม")) NeoGreen else Color(0xFFF59E0B)))
                                 Spacer(Modifier.width(6.dp))
-                                Text(
-                                    status.replace("LOCAL • ", "").replace("NEO • ", ""),
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = Color(0xFFA1A1AA)
-                                )
+                                Text(status.replace("LOCAL • ", "").replace("NEO • ", ""), style = MaterialTheme.typography.labelSmall, color = Color(0xFFA1A1AA))
                             }
                         }
                     }
@@ -303,23 +306,11 @@ fun NeoScreen(
                 modifier = Modifier.weight(1f).fillMaxWidth(),
                 contentPadding = PaddingValues(horizontal = 14.dp, vertical = 18.dp),
                 verticalArrangement = Arrangement.spacedBy(18.dp)
-            ) {
-                items(messages) { NeoMessage(it) }
-            }
+            ) { items(messages) { NeoMessage(it) } }
             Surface(color = NeoDark, shadowElevation = 8.dp) {
-                Row(
-                    Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 12.dp),
-                    verticalAlignment = Alignment.Bottom
-                ) {
-                    Surface(
-                        modifier = Modifier.weight(1f),
-                        shape = RoundedCornerShape(26.dp),
-                        color = NeoCard
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier.padding(start = 16.dp, end = 6.dp)
-                        ) {
+                Row(Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 12.dp), verticalAlignment = Alignment.Bottom) {
+                    Surface(modifier = Modifier.weight(1f), shape = RoundedCornerShape(26.dp), color = NeoCard) {
+                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(start = 16.dp, end = 6.dp)) {
                             TextField(
                                 value = input,
                                 onValueChange = { input = it },
@@ -334,28 +325,19 @@ fun NeoScreen(
                                     unfocusedIndicatorColor = Color.Transparent
                                 )
                             )
-                            IconButton(onClick = onMic) {
-                                Icon(Icons.Default.Mic, "ไมโครโฟน", tint = Color(0xFFD4D4D8))
-                            }
+                            IconButton(onClick = onMic) { Icon(Icons.Default.Mic, "ไมโครโฟน", tint = Color(0xFFD4D4D8)) }
                             FilledIconButton(
                                 onClick = {
                                     val t = input.trim()
                                     if (t.isNotBlank()) {
                                         input = ""
                                         onSend(t)
-                                        scope.launch {
-                                            if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
-                                        }
+                                        scope.launch { if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex) }
                                     }
                                 },
                                 enabled = input.isNotBlank(),
-                                colors = IconButtonDefaults.filledIconButtonColors(
-                                    containerColor = if (input.isNotBlank()) NeoGreen else Color(0xFF3F3F46),
-                                    contentColor = Color.Black
-                                )
-                            ) {
-                                Icon(Icons.Default.ArrowUpward, "ส่ง")
-                            }
+                                colors = IconButtonDefaults.filledIconButtonColors(containerColor = if (input.isNotBlank()) NeoGreen else Color(0xFF3F3F46), contentColor = Color.Black)
+                            ) { Icon(Icons.Default.ArrowUpward, "ส่ง") }
                         }
                     }
                 }
@@ -366,20 +348,9 @@ fun NeoScreen(
 
 @Composable
 private fun EmptyNeoState() {
-    Column(
-        Modifier.fillMaxWidth().padding(horizontal = 28.dp).padding(top = 80.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        Box(
-            Modifier.size(62.dp).clip(CircleShape).background(NeoGreen),
-            contentAlignment = Alignment.Center
-        ) {
-            Text(
-                "N",
-                style = MaterialTheme.typography.headlineMedium,
-                fontWeight = FontWeight.Black,
-                color = Color.Black
-            )
+    Column(Modifier.fillMaxWidth().padding(horizontal = 28.dp).padding(top = 80.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+        Box(Modifier.size(62.dp).clip(CircleShape).background(NeoGreen), contentAlignment = Alignment.Center) {
+            Text("N", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Black, color = Color.Black)
         }
         Spacer(Modifier.height(18.dp))
         Text("มีอะไรให้ NEO ช่วย?", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
@@ -394,34 +365,17 @@ private fun NeoMessage(raw: String) {
     val text = raw.substringAfter(":", raw).trim()
     if (user) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-            Surface(
-                modifier = Modifier.widthIn(max = 310.dp),
-                shape = RoundedCornerShape(22.dp, 22.dp, 6.dp, 22.dp),
-                color = Color(0xFF2B3036)
-            ) {
-                Text(
-                    text,
-                    Modifier.padding(horizontal = 16.dp, vertical = 11.dp),
-                    color = Color(0xFFF4F4F5),
-                    style = MaterialTheme.typography.bodyLarge
-                )
+            Surface(modifier = Modifier.widthIn(max = 310.dp), shape = RoundedCornerShape(22.dp, 22.dp, 6.dp, 22.dp), color = Color(0xFF2B3036)) {
+                Text(text, Modifier.padding(horizontal = 16.dp, vertical = 11.dp), color = Color(0xFFF4F4F5), style = MaterialTheme.typography.bodyLarge)
             }
         }
     } else {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
-            Box(
-                Modifier.size(28.dp).clip(CircleShape).background(NeoGreen),
-                contentAlignment = Alignment.Center
-            ) {
+            Box(Modifier.size(28.dp).clip(CircleShape).background(NeoGreen), contentAlignment = Alignment.Center) {
                 Text("N", fontWeight = FontWeight.Black, color = Color.Black, style = MaterialTheme.typography.labelMedium)
             }
             Spacer(Modifier.width(10.dp))
-            Text(
-                text,
-                Modifier.weight(1f).padding(top = 3.dp, end = 18.dp),
-                color = Color(0xFFE4E4E7),
-                style = MaterialTheme.typography.bodyLarge
-            )
+            Text(text, Modifier.weight(1f).padding(top = 3.dp, end = 18.dp), color = Color(0xFFE4E4E7), style = MaterialTheme.typography.bodyLarge)
         }
     }
 }
