@@ -30,6 +30,7 @@ import com.neo.assistant.data.AppDataDao
 import com.neo.assistant.data.ChatEntity
 import com.neo.assistant.dev.LiveConfigClient
 import com.neo.assistant.dev.NeoLiveConfig
+import com.neo.assistant.knowledge.AdaptiveAnswerEngine
 import com.neo.assistant.knowledge.KnowledgeHub
 import com.neo.assistant.memory.MemoryHub
 import com.neo.assistant.memory.NeoDatabase
@@ -51,6 +52,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var liveClient: LiveConfigClient
     private lateinit var memoryHub: MemoryHub
     private lateinit var knowledgeHub: KnowledgeHub
+    private lateinit var adaptiveEngine: AdaptiveAnswerEngine
     private lateinit var appDataDao: AppDataDao
 
     private val webSearch = WebSearchClient()
@@ -77,6 +79,7 @@ class MainActivity : ComponentActivity() {
         memoryHub = MemoryHub(db.memoryDao())
         appDataDao = db.appDataDao()
         knowledgeHub = KnowledgeHub(appDataDao)
+        adaptiveEngine = AdaptiveAnswerEngine(knowledgeHub, webSearch)
 
         lifecycleScope.launch {
             delay(300)
@@ -125,6 +128,8 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             try {
                 runCatching { appDataDao.insertChat(ChatEntity(role = "user", text = text)) }
+
+                // Truly local facts/identity always win and never need network access.
                 NeoIdentity.answer(text)?.let {
                     safeReply(it)
                     return@launch
@@ -133,9 +138,27 @@ class MainActivity : ComponentActivity() {
                     safeReply(it)
                     return@launch
                 }
-                if (text.contains("จำ")) runCatching { memoryHub.save(text, "user", "brain") }
-                setBrainStatus("NEO • กำลังคิด…")
 
+                if (text.contains("จำ")) runCatching { memoryHub.save(text, "user", "brain") }
+
+                // Unknown/general questions are grounded outside the hard-coded app logic.
+                // AdaptiveAnswerEngine checks learned local cache first. If it misses, it searches
+                // the web, returns evidence-only text and stores the answer for the next question.
+                if (webSearch.canFallbackSearch(text)) {
+                    setBrainStatus("RAG • กำลังตรวจความรู้ที่เคยเรียน…")
+                    val adaptive = runCatching { adaptiveEngine.answer(text) }.getOrNull()
+                    if (adaptive != null && adaptive.text.isNotBlank()) {
+                        setBrainStatus(
+                            if (adaptive.learned) "WEB • เรียนรู้และบันทึกคำตอบแล้ว"
+                            else "LOCAL • ดึงคำตอบจากความรู้ที่จำไว้"
+                        )
+                        safeReply(adaptive.text)
+                        return@launch
+                    }
+                }
+
+                // If external evidence is unavailable, fall back to the local 7B pipeline.
+                setBrainStatus("NEO • กำลังคิด…")
                 val routed = coroutineScope {
                     val m = async { runCatching { memoryHub.retrieve(text) }.getOrNull() }
                     val k = async { runCatching { knowledgeHub.retrieve(text) }.getOrNull() }
@@ -157,7 +180,23 @@ class MainActivity : ComponentActivity() {
                 }.getOrElse {
                     "ขออภัย ระบบสมองมีปัญหาชั่วคราว แต่แอปยังทำงานอยู่ครับ"
                 }
-                safeReply(answer.ifBlank { "ผมรับข้อความแล้วครับ แต่สมองยังสร้างคำตอบไม่ได้ ลองอีกครั้งได้เลย" })
+
+                // One final recovery attempt. This catches local inference failures without
+                // hard-coding a particular topic such as YouTube, food, science, etc.
+                val failedLocal = answer.isBlank() ||
+                    answer.contains("สมอง Local ยังสร้างคำตอบไม่ได้") ||
+                    answer.contains("ระบบสมองมีปัญหา")
+
+                if (failedLocal && webSearch.canFallbackSearch(text)) {
+                    setBrainStatus("WEB • Local ตอบไม่ได้ กำลังค้นคำตอบ…")
+                    val recovered = runCatching { adaptiveEngine.answer(text) }.getOrNull()
+                    if (recovered != null && recovered.text.isNotBlank()) {
+                        safeReply(recovered.text)
+                        return@launch
+                    }
+                }
+
+                safeReply(answer.ifBlank { "ยังไม่พบข้อมูลที่เพียงพอสำหรับตอบคำถามนี้ครับ" })
             } catch (e: Throwable) {
                 safeReply("เกิดข้อผิดพลาด ${e.javaClass.simpleName} — ลองส่งอีกครั้งครับ")
             } finally {
@@ -241,7 +280,7 @@ fun NeoScreen(
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Box(
                                     Modifier.size(7.dp).clip(CircleShape).background(
-                                        if (status.contains("พร้อม")) NeoGreen else Color(0xFFF59E0B)
+                                        if (status.contains("พร้อม") || status.contains("จำไว้")) NeoGreen else Color(0xFFF59E0B)
                                     )
                                 )
                                 Spacer(Modifier.width(6.dp))
@@ -328,10 +367,7 @@ fun NeoScreen(
 @Composable
 private fun EmptyNeoState() {
     Column(
-        Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 28.dp)
-            .padding(top = 80.dp),
+        Modifier.fillMaxWidth().padding(horizontal = 28.dp).padding(top = 80.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Box(
