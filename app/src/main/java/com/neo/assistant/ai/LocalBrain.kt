@@ -18,6 +18,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
 import java.io.FileOutputStream
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
@@ -27,16 +28,16 @@ class LocalBrain(private val context: Context) {
         private const val MODEL_FILE = "Qwen2.5-7B-Instruct-Q4_K_M.gguf"
         private const val MODEL_URL = "https://huggingface.co/lmstudio-community/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_K_M.gguf?download=true"
         private const val MIN_MODEL_BYTES = 4_000_000_000L
-        private const val INFERENCE_TIMEOUT_SECONDS = 60L
+        private const val INFERENCE_TIMEOUT_SECONDS = 90L
     }
 
     private val mutex = Mutex()
     private val client = OkHttpClient.Builder().connectTimeout(30, TimeUnit.SECONDS).readTimeout(0, TimeUnit.SECONDS).build()
-    private val inferenceExecutor = Executors.newSingleThreadExecutor()
+    @Volatile private var inferenceExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val webSearch = WebSearchClient()
     private val knowledgeHub = KnowledgeHub(NeoDatabase.get(context).appDataDao())
     @Volatile private var model: LlamaModel? = null
-    @Volatile private var inferenceTimedOut = false
+    @Volatile private var lastInferenceFailure: String? = null
 
     fun modelFile(): File {
         val dir = context.getExternalFilesDir("models") ?: File(context.filesDir, "models")
@@ -55,18 +56,19 @@ class LocalBrain(private val context: Context) {
             model = Llama.loadModel(
                 file.absolutePath,
                 LlamaConfig(
-                    contextSize = 1536,
+                    contextSize = 1280,
                     threads = Runtime.getRuntime().availableProcessors().coerceIn(4, 6),
                     gpuLayers = 0,
-                    temperature = 0.35f,
-                    topP = 0.88f,
-                    topK = 40
+                    temperature = 0.25f,
+                    topP = 0.85f,
+                    topK = 32
                 )
             )
-            inferenceTimedOut = false
+            lastInferenceFailure = null
             onStatus("LOCAL • Qwen2.5 7B พร้อมใช้งาน")
             true
         } catch (e: Throwable) {
+            lastInferenceFailure = "LOAD_${e.javaClass.simpleName}"
             onStatus("LOCAL • โหลด 7B ไม่สำเร็จ • ${e.javaClass.simpleName}")
             false
         }
@@ -108,64 +110,74 @@ class LocalBrain(private val context: Context) {
         onStatus: (String) -> Unit = {}
     ): String = withContext(Dispatchers.IO) {
         fastPath(message, memories)?.let { return@withContext it }
-
-        if (inferenceTimedOut || !prepare(onStatus)) {
-            return@withContext safeFallback(message, memories, extraContext, onStatus)
-        }
+        if (!prepare(onStatus)) return@withContext safeFallback(message, memories, extraContext, onStatus)
 
         val current = model ?: return@withContext safeFallback(message, memories, extraContext, onStatus)
         val webBlocks = extraContext.filter { it.startsWith("[WEB ") }
-        val knowledgeBlocks = extraContext.filterNot { it.startsWith("[WEB ") }
+        val historyBlocks = extraContext.filter { it.startsWith("[CHAT ") }
+        val knowledgeBlocks = extraContext.filterNot { it.startsWith("[WEB ") || it.startsWith("[CHAT ") }
         val memoryText = memories.take(4).joinToString("\n") { "[${it.category}] ${it.text.take(180)}" }
+        val historyText = historyBlocks.takeLast(8).joinToString("\n") { it.removePrefix("[CHAT] ").take(260) }
         val knowledgeText = knowledgeBlocks.take(3).joinToString("\n\n") { it.take(420) }
         val webText = webBlocks.take(4).joinToString("\n\n") { it.take(500) }
         val isDynamic = webBlocks.isNotEmpty() || webSearch.shouldSearch(message)
 
         val system = buildString {
             append("คุณคือ NEO ผู้ช่วย AI ส่วนตัวบนมือถือ ใช้ Qwen2.5 7B เป็นสมองหลัก\n")
-            append("ตอบภาษาเดียวกับผู้ใช้ และตอบตรงคำถามก่อนเสมอ\n")
-            append("กฎสำคัญ: คำถามความรู้ทั่วไปให้ใช้ความรู้ในโมเดลก่อน ห้ามค้นเว็บเพียงเพราะไม่แน่ใจเล็กน้อย\n")
-            append("Memory คือข้อมูลส่วนตัวของผู้ใช้เท่านั้น และ Knowledge/Web เป็นข้อมูลประกอบ ให้ละทิ้งข้อความที่ไม่เกี่ยวข้อง\n")
-            append("ห้ามคัดลอกข้อความค้นหาดิบ ห้ามแต่งประวัติคน/สถานที่ที่ผู้ใช้ไม่ได้ถาม\n")
-            append("ปกติตอบ 1-4 ประโยค หรือ bullet สั้น ๆ ถ้าผู้ใช้ขอรายละเอียดจึงค่อยตอบยาว\n")
-            append("ถ้าเป็นข้อมูลสด เช่น ข่าว ราคา ค่าเงิน อากาศ ให้ใช้ WEB_CONTEXT เท่านั้นและสรุปให้เข้าใจง่าย\n")
-            append("ถ้าข้อมูลเว็บไม่ตรงคำถาม ให้บอกว่าไม่พบข้อมูลที่ตรง แทนการเดา\n")
-            if (cfg.systemPrompt.isNotBlank()) append("USER_CONFIG: ${cfg.systemPrompt.take(600)}\n")
+            append("ตอบภาษาเดียวกับผู้ใช้ ตอบตรงคำถาม และรักษาบริบทการสนทนาก่อนหน้า\n")
+            append("ถ้าข้อความสั้น เช่น ใช่/ไม่/แล้วล่ะ/ทำไม/ต่อ ให้ตีความจาก CHAT_HISTORY ก่อน ห้ามถือเป็นหัวข้อใหม่เอง\n")
+            append("คำถามความรู้ทั่วไปใช้ความรู้ในโมเดลก่อน ไม่ค้นเว็บถ้าไม่จำเป็น\n")
+            append("Memory เป็นข้อมูลผู้ใช้ และ Knowledge/Web เป็นข้อมูลประกอบ ให้ละทิ้งส่วนที่ไม่เกี่ยวข้อง\n")
+            append("ห้ามแต่งข้อเท็จจริง ห้ามคัดลอกผลค้นหาดิบ และห้ามตอบคนละเรื่อง\n")
+            append("ปกติตอบ 1-4 ประโยค หากไม่มั่นใจในข้อเท็จจริงที่เปลี่ยนตามเวลา ให้ขอ WEB_CONTEXT ด้วย [[NEED_WEB]]\n")
+            append("ถ้าเป็นข้อมูลสด เช่น ข่าว ราคา ค่าเงิน อากาศ ให้ใช้ WEB_CONTEXT เท่านั้น\n")
+            if (cfg.systemPrompt.isNotBlank()) append("USER_CONFIG: ${cfg.systemPrompt.take(500)}\n")
+            if (historyText.isNotBlank()) append("CHAT_HISTORY:\n$historyText\n")
             if (memoryText.isNotBlank()) append("MEMORY:\n$memoryText\n")
             if (knowledgeText.isNotBlank()) append("KNOWLEDGE_CONTEXT:\n$knowledgeText\n")
             if (webText.isNotBlank()) append("WEB_CONTEXT:\n$webText\n")
-            if (isDynamic && webText.isBlank()) append("ถ้าคำถามนี้ต้องการข้อมูลสดและไม่มี WEB_CONTEXT ให้ตอบ [[NEED_WEB]] เท่านั้น\n")
+            if (isDynamic && webText.isBlank()) append("ข้อมูลสดไม่มี WEB_CONTEXT ให้ตอบ [[NEED_WEB]] เท่านั้น\n")
         }
 
         onStatus(if (webBlocks.isNotEmpty()) "WEB • NEO กำลังสรุป…" else "LOCAL • NEO 7B กำลังคิด…")
-        val answer = runInference(current, message.take(800), system.take(6000), cfg.maxTokens.coerceIn(64, 180))
+        val requestedTokens = cfg.maxTokens.coerceIn(48, 140)
+        var answer = runInference(current, message.take(700), system.take(5200), requestedTokens)
 
-        if (answer == null) {
-            inferenceTimedOut = true
-            return@withContext safeFallback(message, memories, extraContext, onStatus)
+        // A single failed native call must not poison every following question.
+        if (answer.isNullOrBlank()) {
+            onStatus("LOCAL • ลองประมวลผลใหม่…")
+            resetExecutor()
+            answer = runInference(current, message.take(500), system.take(3200), requestedTokens.coerceAtMost(80))
         }
 
+        if (answer.isNullOrBlank()) return@withContext safeFallback(message, memories, extraContext, onStatus)
+        lastInferenceFailure = null
         val clean = answer.trim()
-        if (clean.isBlank()) return@withContext safeFallback(message, memories, extraContext, onStatus)
-
-        if (clean.contains("[[NEED_WEB]]")) {
-            return@withContext searchAndSynthesize(message, memories, knowledgeBlocks, onStatus)
-        }
-
+        if (clean.contains("[[NEED_WEB]]")) return@withContext searchAndSynthesize(message, memories, knowledgeBlocks, onStatus)
         clean
     }
 
     private fun runInference(model: LlamaModel, prompt: String, system: String, maxTokens: Int): String? {
-        val future = inferenceExecutor.submit<String> {
+        val executor = inferenceExecutor
+        val future = executor.submit<String> {
             runBlocking { Llama.complete(model, prompt, system, maxTokens = maxTokens).text.trim() }
         }
         return try {
             future.get(INFERENCE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         } catch (_: TimeoutException) {
-            future.cancel(true); null
-        } catch (_: Throwable) {
-            future.cancel(true); null
+            lastInferenceFailure = "TIMEOUT"
+            future.cancel(true)
+            null
+        } catch (e: Throwable) {
+            lastInferenceFailure = e.javaClass.simpleName
+            future.cancel(true)
+            null
         }
+    }
+
+    @Synchronized private fun resetExecutor() {
+        runCatching { inferenceExecutor.shutdownNow() }
+        inferenceExecutor = Executors.newSingleThreadExecutor()
     }
 
     private suspend fun searchAndSynthesize(
@@ -179,21 +191,22 @@ class LocalBrain(private val context: Context) {
         val packet = runCatching { webSearch.search(message) }.getOrNull()
         if (packet == null || packet.results.isEmpty()) return "ยังไม่พบข้อมูลเว็บที่ตรงกับคำถามครับ"
 
-        packet.results.take(3).forEach { r -> runCatching { knowledgeHub.learnWeb(r.title, r.snippet, r.url) } }
         val current = model
-        if (current != null && !inferenceTimedOut) {
+        if (current != null) {
             val webText = packet.results.take(4).mapIndexed { i, r -> "[$i] ${r.title}\n${r.snippet}" }.joinToString("\n\n")
             val system = """
-                คุณคือ NEO ให้ตอบคำถามจาก WEB_CONTEXT ด้านล่างเท่านั้น
-                สรุปให้ตรงคำถาม ไม่คัดลอกข้อความดิบ ไม่พูดเรื่องที่ไม่เกี่ยวข้อง
-                ตอบภาษาเดียวกับผู้ใช้ ปกติ 1-4 ประโยค ถ้าเป็นข่าวให้สรุปไม่เกิน 3 หัวข้อ
-                ถ้าข้อมูลไม่พอให้บอกตรง ๆ ว่ายังไม่พบข้อมูลที่ตรง
+                คุณคือ NEO ตอบจาก WEB_CONTEXT เท่านั้น
+                เลือกเฉพาะข้อความที่ตรงคำถาม ถ้าหลักฐานไม่ตรงหรือไม่พอให้บอกว่าไม่พบข้อมูลที่ตรง
+                ห้ามคัดลอกข้อความดิบ ห้ามแต่งข้อมูล ตอบภาษาเดียวกับผู้ใช้ 1-4 ประโยค
                 WEB_CONTEXT:
-                ${webText.take(3500)}
+                ${webText.take(3200)}
             """.trimIndent()
             onStatus("WEB • NEO 7B กำลังสรุป…")
-            val synthesized = runInference(current, message.take(700), system, 140)
-            if (!synthesized.isNullOrBlank() && !synthesized.contains("[[NEED_WEB]]")) return synthesized.trim()
+            val synthesized = runInference(current, message.take(600), system, 100)
+            if (!synthesized.isNullOrBlank() && !synthesized.contains("[[NEED_WEB]]")) {
+                packet.results.take(2).forEach { r -> runCatching { knowledgeHub.learnWeb(r.title, r.snippet, r.url) } }
+                return synthesized.trim()
+            }
         }
         return conciseWebFallback(message, packet.results)
     }
@@ -204,6 +217,13 @@ class LocalBrain(private val context: Context) {
         extraContext: List<String>,
         onStatus: (String) -> Unit
     ): String {
+        val q = message.lowercase().trim()
+        if (q.contains("ตอบช้า") || q.contains("ทำไมช้า") || q.contains("ช้าจัง")) {
+            val why = lastInferenceFailure ?: "กำลังประมวลผลโมเดล 7B บนเครื่อง"
+            return "เพราะ NEO รันโมเดล 7B บนมือถือครับ รอบล่าสุดสถานะ $why เลยใช้เวลานานกว่าปกติ แต่ผมจะลองกู้การประมวลผลใหม่อัตโนมัติในคำถามถัดไป"
+        }
+        if (q in setOf("ดีครับ","ดี","โอเค","ok","ครับ","ใช่","อืม","อือ")) return "ครับ มีอะไรถามต่อได้เลย"
+
         val webBlocks = extraContext.filter { it.startsWith("[WEB ") }
         if (webBlocks.isNotEmpty()) {
             val results = webBlocks.mapNotNull { parseBlock(it) }
@@ -217,7 +237,7 @@ class LocalBrain(private val context: Context) {
         if (memories.isNotEmpty() && (message.contains("จำ") || message.contains("ข้อมูลของผม"))) {
             return "ผมจำได้ว่า ${memories.take(3).joinToString(" / ") { it.text.take(100) }}"
         }
-        return "ตอนนี้สมอง Local ยังสร้างคำตอบไม่ได้ครับ ลองถามใหม่อีกครั้งได้เลย"
+        return "ตอนนี้ประมวลผล Local ไม่สำเร็จครับ (${lastInferenceFailure ?: "UNKNOWN"}) แต่ระบบจะลองใหม่อัตโนมัติในคำถามถัดไป"
     }
 
     private fun fastPath(message: String, memories: List<MemoryEntity>): String? {
@@ -250,18 +270,14 @@ class LocalBrain(private val context: Context) {
     private fun conciseWebFallback(message: String, results: List<WebSearchClient.Result>): String {
         val q = message.lowercase()
         if (results.isEmpty()) return "ยังไม่พบข้อมูลที่ตรงกับคำถามครับ"
-        if (listOf("dollar", "ดอลลาร์", "usd", "ค่าเงิน", "อัตราแลกเปลี่ยน", "บาท", "eur", "jpy", "gbp").any { q.contains(it) }) {
-            return results.first().snippet.take(140)
-        }
-        if (listOf("ข่าว", "news", "ล่าสุด", "อัปเดต").any { q.contains(it) }) {
-            return "ข่าวล่าสุดที่พบ:\n" + results.take(3).mapIndexed { i, r -> "${i + 1}. ${r.title.take(110)}" }.joinToString("\n")
-        }
+        if (listOf("dollar", "ดอลลาร์", "usd", "ค่าเงิน", "อัตราแลกเปลี่ยน", "บาท", "eur", "jpy", "gbp").any { q.contains(it) }) return results.first().snippet.take(180)
+        if (listOf("ข่าว", "news", "ล่าสุด", "อัปเดต").any { q.contains(it) }) return "ข่าวล่าสุดที่พบ:\n" + results.take(3).mapIndexed { i, r -> "${i + 1}. ${r.title.take(110)}" }.joinToString("\n")
         return results.first().snippet.take(260).ifBlank { results.first().title }
     }
 
     fun release() {
-        inferenceExecutor.shutdownNow()
-        if (!inferenceTimedOut) model?.let { runCatching { Llama.releaseModel(it) } }
+        runCatching { inferenceExecutor.shutdownNow() }
+        model?.let { runCatching { Llama.releaseModel(it) } }
         model = null
     }
 }
