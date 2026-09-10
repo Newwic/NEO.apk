@@ -3,16 +3,8 @@ package com.neo.assistant.knowledge
 import com.neo.assistant.web.WebSearchClient
 
 /**
- * Generic answer recovery layer for questions that are not hard-coded.
- *
- * Flow:
- * 1) Try previously learned local knowledge first.
- * 2) If nothing relevant is cached, search the web.
- * 3) Build a short grounded answer from search snippets.
- * 4) Save the answer + sources locally so the same/similar question is faster next time.
- *
- * This layer deliberately does not invent facts. If it cannot obtain useful evidence,
- * it returns null and lets the caller report that evidence was insufficient.
+ * Evidence-first recovery for questions not covered by local tools.
+ * Never returns unrelated search snippets as an answer.
  */
 class AdaptiveAnswerEngine(
     private val knowledgeHub: KnowledgeHub,
@@ -29,94 +21,131 @@ class AdaptiveAnswerEngine(
         val q = query.trim()
         if (q.length < 2 || !webSearch.canFallbackSearch(q)) return null
 
-        // Fast path: use locally learned answer before touching the network.
-        val cached = knowledgeHub.retrieve(q, limit = 4)
+        // Meta/conversation/ability prompts belong to the local model, not a web search.
+        if (isConversationalOrAbility(q)) return null
+
+        // Exact learned Q/A first. Do not reuse a merely "similar" block as an answer.
+        val cached = knowledgeHub.retrieve(q, limit = 6)
         val learnedBlocks = cached.blocks.filter {
             it.contains("| learned-answer]") || it.contains("| learned-web]")
         }
-        cachedAnswer(q, learnedBlocks, cached.sources)?.let { return it }
+        exactCachedAnswer(q, learnedBlocks, cached.sources)?.let { return it }
 
-        // No useful cached answer: search externally.
         val packet = runCatching { webSearch.search(q) }.getOrNull() ?: return null
-        val results = packet.results
+        val candidates = packet.results
             .filter { it.title.isNotBlank() && it.snippet.isNotBlank() }
-            .take(4)
-        if (results.isEmpty()) return null
+            .distinctBy { it.url }
 
-        val answerText = groundedSummary(results)
+        // Critical anti-hallucination gate: only evidence that actually overlaps the question.
+        val relevant = candidates
+            .map { it to relevance(q, "${it.title} ${it.snippet}") }
+            .filter { (_, score) -> score >= 0.16 }
+            .sortedByDescending { it.second }
+            .map { it.first }
+            .take(3)
+
+        if (relevant.isEmpty()) return null
+
+        val answerText = groundedSummary(relevant)
         if (answerText.isBlank()) return null
 
-        val sourceText = results.joinToString("\n") { "${it.title} — ${it.url}" }
+        val sourceText = relevant.joinToString("\n") { "${it.title} — ${it.url}" }
         val cacheBody = buildString {
             append("คำถาม: ").append(q).append('\n')
             append("คำตอบ: ").append(answerText).append('\n')
             append("แหล่งข้อมูล:\n").append(sourceText)
         }
 
-        // Save both a Q/A cache and raw web evidence for later retrieval.
         runCatching {
             knowledgeHub.importText(
                 title = "Q: $q",
                 text = cacheBody,
-                sourceUri = results.first().url,
+                sourceUri = relevant.first().url,
                 source = "learned-answer"
             )
         }
-        results.take(3).forEach { r ->
-            runCatching { knowledgeHub.learnWeb(r.title, r.snippet, r.url) }
-        }
+        relevant.forEach { r -> runCatching { knowledgeHub.learnWeb(r.title, r.snippet, r.url) } }
 
         return Answer(
             text = answerText,
-            route = "WEB → learned-answer → local knowledge",
+            route = "WEB → verified evidence → local cache",
             learned = true,
-            sources = results.map { it.url }
+            sources = relevant.map { it.url }
         )
     }
 
-    private fun cachedAnswer(query: String, blocks: List<String>, sources: List<String>): Answer? {
-        if (blocks.isEmpty()) return null
-        // Prefer an exact learned Q/A entry when available.
+    private fun exactCachedAnswer(query: String, blocks: List<String>, sources: List<String>): Answer? {
         val exact = blocks.firstOrNull { it.contains("Q: $query", ignoreCase = true) }
             ?: blocks.firstOrNull { it.contains("คำถาม: $query", ignoreCase = true) }
-        if (exact != null) {
-            val body = exact.substringAfter('\n', "")
-            val answer = body.substringAfter("คำตอบ:", "")
-                .substringBefore("แหล่งข้อมูล:")
-                .trim()
-            if (answer.length >= 8) {
-                return Answer(answer, "LOCAL CACHE", learned = false, sources = sources.take(3))
-            }
-        }
-
-        // For similar questions, only use a sufficiently informative learned block.
-        val best = blocks.firstOrNull() ?: return null
-        val body = best.substringAfter('\n', "").trim()
-        val extracted = body.substringAfter("คำตอบ:", body)
+            ?: return null
+        val answer = exact.substringAfter("คำตอบ:", "")
             .substringBefore("แหล่งข้อมูล:")
             .trim()
-        if (extracted.length < 24) return null
-        return Answer(extracted.take(900), "LOCAL RAG CACHE", learned = false, sources = sources.take(3))
+        if (answer.length < 4) return null
+        return Answer(answer.take(900), "LOCAL EXACT CACHE", learned = false, sources = sources.take(3))
+    }
+
+    private fun isConversationalOrAbility(query: String): Boolean {
+        val q = query.lowercase().replace(Regex("\\s+"), "")
+        val patterns = listOf(
+            "ทำได้ไหม", "ได้ไหม", "เขียนcode", "เขียนโค้ด", "ช่วยได้", "ช่วยอะไร",
+            "ทำอะไรได้", "เก่งอะไร", "ตอบไม่ตรง", "ตอบมั่ว", "เข้าใจไหม", "รู้ไหม",
+            "canyou", "areyou", "doyou"
+        )
+        // Questions such as "รู้ไหมว่า X คืออะไร" can still be factual; only short/meta prompts are local.
+        return patterns.any { q.contains(it) } && q.length < 55
+    }
+
+    private fun relevance(query: String, evidence: String): Double {
+        val q = normalize(query)
+        val e = normalize(evidence)
+        if (q.isBlank() || e.isBlank()) return 0.0
+
+        val latin = Regex("[a-z0-9]{3,}").findAll(q).map { it.value }.toSet()
+        if (latin.isNotEmpty()) {
+            val hits = latin.count { e.contains(it) }
+            if (hits > 0) return (0.55 + 0.45 * hits.toDouble() / latin.size).coerceAtMost(1.0)
+        }
+
+        val q3 = trigrams(q)
+        val e3 = trigrams(e)
+        if (q3.isEmpty() || e3.isEmpty()) return 0.0
+        val overlap = q3.count { it in e3 }
+        // Coverage of query trigrams is more useful than Jaccard because evidence is much longer.
+        return overlap.toDouble() / q3.size
+    }
+
+    private fun normalize(s: String): String = s.lowercase()
+        .replace(Regex("https?://\\S+"), " ")
+        .replace(Regex("[^a-z0-9ก-๙]+"), "")
+        .replace("อะไร", "")
+        .replace("คือ", "")
+        .replace("เท่าไหร่", "")
+        .replace("เท่ากับ", "")
+        .replace("ขอ", "")
+        .replace("หน่อย", "")
+        .trim()
+
+    private fun trigrams(s: String): Set<String> {
+        if (s.length < 3) return if (s.isBlank()) emptySet() else setOf(s)
+        return (0..s.length - 3).map { s.substring(it, it + 3) }.toSet()
     }
 
     private fun groundedSummary(results: List<WebSearchClient.Result>): String {
-        // Keep only evidence returned by providers. No model-generated facts are added here.
-        val unique = results
-            .map { clean(it.snippet) }
+        val unique = results.map { clean(it.snippet) }
             .filter { it.length >= 12 }
             .distinct()
-            .take(3)
+            .take(2)
         if (unique.isEmpty()) return ""
-        return when (unique.size) {
-            1 -> unique.first().take(700)
-            else -> unique.mapIndexed { index, text -> "${index + 1}. ${text.take(500)}" }.joinToString("\n")
-        }
+        // One strong result is preferable to dumping several unrelated search fragments.
+        return unique.first().take(650)
     }
 
     private fun clean(text: String): String = text
         .replace(Regex("<[^>]+>"), " ")
         .replace("&quot;", "\"")
         .replace("&amp;", "&")
+        .replace("&#39;", "'")
         .replace(Regex("\\s+"), " ")
         .trim()
 }
