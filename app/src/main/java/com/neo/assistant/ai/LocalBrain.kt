@@ -31,11 +31,14 @@ class LocalBrain(private val context: Context) {
         private const val INFERENCE_TIMEOUT_SECONDS = 90L
     }
 
-    private val mutex = Mutex()
+    private val modelMutex = Mutex()
+    private val generationMutex = Mutex()
     private val client = OkHttpClient.Builder().connectTimeout(30, TimeUnit.SECONDS).readTimeout(0, TimeUnit.SECONDS).build()
     @Volatile private var inferenceExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val db = NeoDatabase.get(context)
+    private val appDataDao = db.appDataDao()
     private val webSearch = WebSearchClient()
-    private val knowledgeHub = KnowledgeHub(NeoDatabase.get(context).appDataDao())
+    private val knowledgeHub = KnowledgeHub(appDataDao)
     @Volatile private var model: LlamaModel? = null
     @Volatile private var lastInferenceFailure: String? = null
 
@@ -45,7 +48,7 @@ class LocalBrain(private val context: Context) {
         return File(dir, MODEL_FILE)
     }
 
-    suspend fun prepare(onStatus: (String) -> Unit = {}): Boolean = mutex.withLock {
+    suspend fun prepare(onStatus: (String) -> Unit = {}): Boolean = modelMutex.withLock {
         if (model != null) return@withLock true
         val file = modelFile()
         if (!file.exists() || file.length() < MIN_MODEL_BYTES) {
@@ -59,9 +62,9 @@ class LocalBrain(private val context: Context) {
                     contextSize = 1280,
                     threads = Runtime.getRuntime().availableProcessors().coerceIn(4, 6),
                     gpuLayers = 0,
-                    temperature = 0.25f,
-                    topP = 0.85f,
-                    topK = 32
+                    temperature = 0.22f,
+                    topP = 0.82f,
+                    topK = 28
                 )
             )
             lastInferenceFailure = null
@@ -108,53 +111,65 @@ class LocalBrain(private val context: Context) {
         cfg: NeoLiveConfig,
         extraContext: List<String> = emptyList(),
         onStatus: (String) -> Unit = {}
-    ): String = withContext(Dispatchers.IO) {
-        fastPath(message, memories)?.let { return@withContext it }
-        if (!prepare(onStatus)) return@withContext safeFallback(message, memories, extraContext, onStatus)
+    ): String = generationMutex.withLock {
+        withContext(Dispatchers.IO) {
+            fastPath(message, memories)?.let { return@withContext it }
+            if (!prepare(onStatus)) return@withContext safeFallback(message, memories, extraContext, onStatus)
 
-        val current = model ?: return@withContext safeFallback(message, memories, extraContext, onStatus)
-        val webBlocks = extraContext.filter { it.startsWith("[WEB ") }
-        val historyBlocks = extraContext.filter { it.startsWith("[CHAT ") }
-        val knowledgeBlocks = extraContext.filterNot { it.startsWith("[WEB ") || it.startsWith("[CHAT ") }
-        val memoryText = memories.take(4).joinToString("\n") { "[${it.category}] ${it.text.take(180)}" }
-        val historyText = historyBlocks.takeLast(8).joinToString("\n") { it.removePrefix("[CHAT] ").take(260) }
-        val knowledgeText = knowledgeBlocks.take(3).joinToString("\n\n") { it.take(420) }
-        val webText = webBlocks.take(4).joinToString("\n\n") { it.take(500) }
-        val isDynamic = webBlocks.isNotEmpty() || webSearch.shouldSearch(message)
+            val current = model ?: return@withContext safeFallback(message, memories, extraContext, onStatus)
+            val webBlocks = extraContext.filter { it.startsWith("[WEB ") }
+            val suppliedHistoryBlocks = extraContext.filter { it.startsWith("[CHAT ") }
+            val knowledgeBlocks = extraContext.filterNot { it.startsWith("[WEB ") || it.startsWith("[CHAT ") }
+            val memoryText = memories.take(4).joinToString("\n") { "[${it.category}] ${it.text.take(180)}" }
 
-        val system = buildString {
-            append("คุณคือ NEO ผู้ช่วย AI ส่วนตัวบนมือถือ ใช้ Qwen2.5 7B เป็นสมองหลัก\n")
-            append("ตอบภาษาเดียวกับผู้ใช้ ตอบตรงคำถาม และรักษาบริบทการสนทนาก่อนหน้า\n")
-            append("ถ้าข้อความสั้น เช่น ใช่/ไม่/แล้วล่ะ/ทำไม/ต่อ ให้ตีความจาก CHAT_HISTORY ก่อน ห้ามถือเป็นหัวข้อใหม่เอง\n")
-            append("คำถามความรู้ทั่วไปใช้ความรู้ในโมเดลก่อน ไม่ค้นเว็บถ้าไม่จำเป็น\n")
-            append("Memory เป็นข้อมูลผู้ใช้ และ Knowledge/Web เป็นข้อมูลประกอบ ให้ละทิ้งส่วนที่ไม่เกี่ยวข้อง\n")
-            append("ห้ามแต่งข้อเท็จจริง ห้ามคัดลอกผลค้นหาดิบ และห้ามตอบคนละเรื่อง\n")
-            append("ปกติตอบ 1-4 ประโยค หากไม่มั่นใจในข้อเท็จจริงที่เปลี่ยนตามเวลา ให้ขอ WEB_CONTEXT ด้วย [[NEED_WEB]]\n")
-            append("ถ้าเป็นข้อมูลสด เช่น ข่าว ราคา ค่าเงิน อากาศ ให้ใช้ WEB_CONTEXT เท่านั้น\n")
-            if (cfg.systemPrompt.isNotBlank()) append("USER_CONFIG: ${cfg.systemPrompt.take(500)}\n")
-            if (historyText.isNotBlank()) append("CHAT_HISTORY:\n$historyText\n")
-            if (memoryText.isNotBlank()) append("MEMORY:\n$memoryText\n")
-            if (knowledgeText.isNotBlank()) append("KNOWLEDGE_CONTEXT:\n$knowledgeText\n")
-            if (webText.isNotBlank()) append("WEB_CONTEXT:\n$webText\n")
-            if (isDynamic && webText.isBlank()) append("ข้อมูลสดไม่มี WEB_CONTEXT ให้ตอบ [[NEED_WEB]] เท่านั้น\n")
+            val dbHistory = runCatching {
+                val recent = appDataDao.recentChats(12).asReversed()
+                val withoutCurrent = if (recent.lastOrNull()?.role == "user" && recent.lastOrNull()?.text?.trim() == message.trim()) recent.dropLast(1) else recent
+                withoutCurrent.takeLast(8).joinToString("\n") {
+                    (if (it.role == "user") "ผู้ใช้: " else "NEO: ") + it.text.take(220)
+                }
+            }.getOrDefault("")
+            val suppliedHistory = suppliedHistoryBlocks.takeLast(8).joinToString("\n") { it.removePrefix("[CHAT] ").take(260) }
+            val historyText = listOf(dbHistory, suppliedHistory).filter { it.isNotBlank() }.joinToString("\n")
+
+            val knowledgeText = knowledgeBlocks.take(3).joinToString("\n\n") { it.take(420) }
+            val webText = webBlocks.take(4).joinToString("\n\n") { it.take(500) }
+            val isDynamic = webBlocks.isNotEmpty() || webSearch.shouldSearch(message)
+
+            val system = buildString {
+                append("คุณคือ NEO ผู้ช่วย AI ส่วนตัวบนมือถือ ใช้ Qwen2.5 7B เป็นสมองหลัก\n")
+                append("ตอบภาษาเดียวกับผู้ใช้ ตอบตรงคำถาม และรักษาบริบทการสนทนาก่อนหน้า\n")
+                append("ถ้าผู้ใช้ถามหลายข้อความติดกัน ให้ตอบทุกข้อความตามลำดับ ห้ามทำข้อความล่าสุดหาย\n")
+                append("ถ้าข้อความสั้น เช่น ใช่/ไม่/แล้วล่ะ/ทำไม/ต่อ ให้ตีความจาก CHAT_HISTORY ก่อน ห้ามถือเป็นหัวข้อใหม่เอง\n")
+                append("คำถามความรู้ทั่วไปใช้ความรู้ในโมเดลก่อน ไม่ค้นเว็บถ้าไม่จำเป็น\n")
+                append("Memory เป็นข้อมูลผู้ใช้ และ Knowledge/Web เป็นข้อมูลประกอบ ให้ละทิ้งส่วนที่ไม่เกี่ยวข้อง\n")
+                append("ห้ามแต่งข้อเท็จจริง ห้ามคัดลอกผลค้นหาดิบ และห้ามตอบคนละเรื่อง\n")
+                append("ปกติตอบ 1-4 ประโยค หากไม่มั่นใจในข้อเท็จจริงที่เปลี่ยนตามเวลา ให้ขอ WEB_CONTEXT ด้วย [[NEED_WEB]]\n")
+                append("ถ้าเป็นข้อมูลสด เช่น ข่าว ราคา ค่าเงิน อากาศ ให้ใช้ WEB_CONTEXT เท่านั้น\n")
+                if (cfg.systemPrompt.isNotBlank()) append("USER_CONFIG: ${cfg.systemPrompt.take(500)}\n")
+                if (historyText.isNotBlank()) append("CHAT_HISTORY:\n${historyText.take(1800)}\n")
+                if (memoryText.isNotBlank()) append("MEMORY:\n$memoryText\n")
+                if (knowledgeText.isNotBlank()) append("KNOWLEDGE_CONTEXT:\n$knowledgeText\n")
+                if (webText.isNotBlank()) append("WEB_CONTEXT:\n$webText\n")
+                if (isDynamic && webText.isBlank()) append("ข้อมูลสดไม่มี WEB_CONTEXT ให้ตอบ [[NEED_WEB]] เท่านั้น\n")
+            }
+
+            onStatus(if (webBlocks.isNotEmpty()) "WEB • NEO กำลังสรุป…" else "LOCAL • NEO 7B กำลังคิด…")
+            val requestedTokens = cfg.maxTokens.coerceIn(48, 140)
+            var answer = runInference(current, message.take(700), system.take(5200), requestedTokens)
+
+            if (answer.isNullOrBlank()) {
+                onStatus("LOCAL • ลองประมวลผลใหม่…")
+                resetExecutor()
+                answer = runInference(current, message.take(500), system.take(3200), requestedTokens.coerceAtMost(80))
+            }
+
+            if (answer.isNullOrBlank()) return@withContext safeFallback(message, memories, extraContext, onStatus)
+            lastInferenceFailure = null
+            val clean = answer.trim()
+            if (clean.contains("[[NEED_WEB]]")) return@withContext searchAndSynthesize(message, memories, knowledgeBlocks, onStatus)
+            clean
         }
-
-        onStatus(if (webBlocks.isNotEmpty()) "WEB • NEO กำลังสรุป…" else "LOCAL • NEO 7B กำลังคิด…")
-        val requestedTokens = cfg.maxTokens.coerceIn(48, 140)
-        var answer = runInference(current, message.take(700), system.take(5200), requestedTokens)
-
-        // A single failed native call must not poison every following question.
-        if (answer.isNullOrBlank()) {
-            onStatus("LOCAL • ลองประมวลผลใหม่…")
-            resetExecutor()
-            answer = runInference(current, message.take(500), system.take(3200), requestedTokens.coerceAtMost(80))
-        }
-
-        if (answer.isNullOrBlank()) return@withContext safeFallback(message, memories, extraContext, onStatus)
-        lastInferenceFailure = null
-        val clean = answer.trim()
-        if (clean.contains("[[NEED_WEB]]")) return@withContext searchAndSynthesize(message, memories, knowledgeBlocks, onStatus)
-        clean
     }
 
     private fun runInference(model: LlamaModel, prompt: String, system: String, maxTokens: Int): String? {
@@ -220,7 +235,7 @@ class LocalBrain(private val context: Context) {
         val q = message.lowercase().trim()
         if (q.contains("ตอบช้า") || q.contains("ทำไมช้า") || q.contains("ช้าจัง")) {
             val why = lastInferenceFailure ?: "กำลังประมวลผลโมเดล 7B บนเครื่อง"
-            return "เพราะ NEO รันโมเดล 7B บนมือถือครับ รอบล่าสุดสถานะ $why เลยใช้เวลานานกว่าปกติ แต่ผมจะลองกู้การประมวลผลใหม่อัตโนมัติในคำถามถัดไป"
+            return "เพราะ NEO รันโมเดล 7B บนมือถือครับ รอบล่าสุดสถานะ $why เลยใช้เวลานานกว่าปกติ แต่ระบบจะลองกู้การประมวลผลใหม่อัตโนมัติ"
         }
         if (q in setOf("ดีครับ","ดี","โอเค","ok","ครับ","ใช่","อืม","อือ")) return "ครับ มีอะไรถามต่อได้เลย"
 
