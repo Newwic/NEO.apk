@@ -94,7 +94,7 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // Single consumer: every message is processed exactly once and in send order.
+        // One consumer guarantees FIFO processing: every user message gets one turn in order.
         lifecycleScope.launch {
             for (text in messageQueue) {
                 processUserMessage(text)
@@ -134,9 +134,7 @@ class MainActivity : ComponentActivity() {
         val text = raw.trim()
         if (text.isBlank()) return
         submitMessage?.invoke("คุณ: $text")
-        lifecycleScope.launch {
-            messageQueue.send(text)
-        }
+        lifecycleScope.launch { messageQueue.send(text) }
     }
 
     private suspend fun processUserMessage(text: String) {
@@ -154,17 +152,8 @@ class MainActivity : ComponentActivity() {
 
             if (text.contains("จำ")) runCatching { memoryHub.save(text, "user", "brain") }
 
-            // Only fresh/current questions are allowed to take the adaptive web-first route.
-            if (webSearch.canFallbackSearch(text)) {
-                setBrainStatus("RAG • กำลังตรวจความรู้ที่เคยเรียน…")
-                val adaptive = runCatching { adaptiveEngine.answer(text) }.getOrNull()
-                if (adaptive != null && adaptive.text.isNotBlank()) {
-                    setBrainStatus(if (adaptive.learned) "WEB • เรียนรู้และบันทึกคำตอบแล้ว" else "LOCAL • ดึงคำตอบจากความรู้ที่จำไว้")
-                    safeReply(adaptive.text)
-                    return
-                }
-            }
-
+            // Local-first architecture: only fetch the web up front for genuinely fresh/current queries.
+            // Stable knowledge is answered by Qwen first; if Qwen fails, verified web recovery runs below.
             setBrainStatus("NEO • กำลังคิด…")
             val routed = coroutineScope {
                 val m = async { runCatching { memoryHub.retrieve(text) }.getOrNull() }
@@ -179,13 +168,14 @@ class MainActivity : ComponentActivity() {
             val blocks = mutableListOf<String>()
             blocks.addAll(routed.second?.blocks.orEmpty())
 
-            // Explicitly provide the latest dialogue to the local model as context.
+            // Sliding conversation context for follow-up questions such as "แล้วล่ะ" / "ทำไม" / "ต่อ".
             runCatching {
                 appDataDao.recentChats(10).asReversed().dropLast(1).takeLast(8).forEach {
                     blocks.add("[CHAT] ${if (it.role == "user") "ผู้ใช้" else "NEO"}: ${it.text.take(220)}")
                 }
             }
 
+            // Fresh data is supplied as evidence. Local Qwen synthesizes it instead of exposing raw snippets.
             routed.third?.results?.take(3)?.forEachIndexed { i, r ->
                 blocks.add("[WEB ${i + 1}: ${r.title}]\n${r.snippet}\nSOURCE: ${r.url}")
             }
@@ -199,11 +189,12 @@ class MainActivity : ComponentActivity() {
             val failedLocal = answer.isBlank() ||
                 answer.contains("สมอง Local ยังสร้างคำตอบไม่ได้") ||
                 answer.contains("ประมวลผล Local ไม่สำเร็จ") ||
-                answer.contains("ระบบสมองมีปัญหา")
+                answer.contains("ระบบสมองมีปัญหา") ||
+                answer.contains("[[NEED_WEB]]")
 
             if (failedLocal && webSearch.canFallbackSearch(text)) {
-                setBrainStatus("WEB • Local ตอบไม่ได้ กำลังค้นคำตอบ…")
-                val recovered = runCatching { adaptiveEngine.answer(text) }.getOrNull()
+                setBrainStatus("WEB • Local ตอบไม่ได้ กำลังหาหลักฐานที่ตรงคำถาม…")
+                val recovered = runCatching { adaptiveEngine.answer(text, forceWeb = true) }.getOrNull()
                 if (recovered != null && recovered.text.isNotBlank()) {
                     safeReply(recovered.text)
                     return
