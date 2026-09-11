@@ -5,8 +5,8 @@ import com.neo.assistant.dev.NeoLiveConfig
 import com.neo.assistant.knowledge.KnowledgeHub
 import com.neo.assistant.memory.MemoryEntity
 import com.neo.assistant.memory.NeoDatabase
-import com.neo.assistant.web.SearchResult
 import com.neo.assistant.web.WebSearchClient
+import com.neo.assistant.web.WebSearchClient.Result as SearchResult
 import dev.ffmpegkit.llama.Llama
 import dev.ffmpegkit.llama.LlamaConfig
 import dev.ffmpegkit.llama.LlamaModel
