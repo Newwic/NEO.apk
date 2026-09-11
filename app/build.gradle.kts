@@ -10,7 +10,9 @@ android {
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.neo.assistant"
+        // Fresh-install package ID so the rebuilt NEO can be installed beside the old app
+        // even when the previous APK was signed with a different certificate.
+        applicationId = "com.neo.assistant.rebuild"
         minSdk = 26
         targetSdk = 35
 
