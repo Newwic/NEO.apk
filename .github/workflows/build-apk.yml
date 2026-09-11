@@ -3,7 +3,7 @@ name: Build NEO APK
 on:
   workflow_dispatch:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "neo-v1-rebuild" ]
 
 permissions:
   contents: read
@@ -49,11 +49,11 @@ jobs:
         run: test -s app/build/outputs/apk/debug/app-debug.apk
 
       - name: Rename APK
-        run: cp app/build/outputs/apk/debug/app-debug.apk NEO.apk
+        run: cp app/build/outputs/apk/debug/app-debug.apk NEO-v1-rebuild.apk
 
       - name: Upload NEO APK
         uses: actions/upload-artifact@v4
         with:
-          name: NEO-APK
-          path: NEO.apk
+          name: NEO-V1-REBUILD-APK
+          path: NEO-v1-rebuild.apk
           retention-days: 30
