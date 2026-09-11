@@ -19,4 +19,10 @@ interface MemoryDao {
 
     @Query("UPDATE memories SET accessCount = accessCount + 1, updatedAt = :now WHERE id IN (:ids)")
     suspend fun markAccessed(ids: List<Long>, now: Long = System.currentTimeMillis())
+
+    @Query("DELETE FROM memories WHERE id = :id")
+    suspend fun deleteById(id: Long)
+
+    @Query("DELETE FROM memories")
+    suspend fun clearAll()
 }
