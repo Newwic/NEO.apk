@@ -12,4 +12,16 @@ class NeoSettings(context: Context) {
     var pcWorkerUrl: String
         get() = prefs.getString("pc_worker_url", "http://192.168.1.10:8765") ?: "http://192.168.1.10:8765"
         set(value) = prefs.edit().putString("pc_worker_url", value.trim().removeSuffix("/")).apply()
+
+    var selectedModelId: String
+        get() = prefs.getString("selected_model", "balanced") ?: "balanced"
+        set(value) = prefs.edit().putString("selected_model", value).apply()
+
+    var autoSpeak: Boolean
+        get() = prefs.getBoolean("auto_speak", false)
+        set(value) = prefs.edit().putBoolean("auto_speak", value).apply()
+
+    var webFallbackEnabled: Boolean
+        get() = prefs.getBoolean("web_fallback", true)
+        set(value) = prefs.edit().putBoolean("web_fallback", value).apply()
 }
