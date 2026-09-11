@@ -19,7 +19,7 @@ enum class ModelProfile(
         description = "เร็วมาก / ใช้แบตน้อย / เหมาะกับแชตทั่วไป เปิดแอป และตั้งปลุก",
         approxSizeGb = 1.3,
         fileName = "Qwen3-1.7B-Q4_K_M.gguf",
-        downloadUrl = "https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_K_M.gguf?download=true",
+        downloadUrl = "https://huggingface.co/ggml-org/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_K_M.gguf?download=true",
         minimumBytes = 1_000_000_000L,
         contextSize = 4096,
         maxTokens = 192
